@@ -1,0 +1,23 @@
+# TraderJP — ES Futures Bot dependencies
+
+# Web framework + server
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# HTTP client
+requests>=2.31.0
+
+# Async HTTP (used by FastAPI internally)
+httpx>=0.27.0
+
+# Pydantic v2 (FastAPI data validation)
+pydantic>=2.7.0
+
+# Environment / config
+python-dotenv>=1.0.1
+
+# Timezone handling
+pytz>=2024.1
+
+# Structured logging
+loguru>=0.7.2
