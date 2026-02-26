@@ -21,3 +21,6 @@ pytz>=2024.1
 
 # Structured logging
 loguru>=0.7.2
+
+# WebSocket client (market data streaming)
+websockets>=12.0

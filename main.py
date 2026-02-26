@@ -104,6 +104,17 @@ def _float(key: str, default: float = 0.0) -> float:
 # Main
 # ------------------------------------------------------------------
 
+async def _token_refresh_loop(client):
+    """Hourly token-refresh task (module-level so it can be passed to gather)."""
+    from bot.tradovate_client import TradovateError
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            client.ensure_auth()
+        except TradovateError as e:
+            logger.error(f"Token refresh failed: {e}")
+
+
 async def main():
     setup_logging()
     logger.info("=" * 60)
@@ -111,13 +122,15 @@ async def main():
     logger.info("=" * 60)
 
     # ---- Import modules here (after logging is configured) --------
-    from bot.tradovate_client import TradovateClient, TradovateError
-    from bot.risk_manager     import RiskManager, ApexConfig
-    from bot.news_filter      import NewsFilter
-    from bot.session_filter   import SessionFilter, SessionConfig
-    from bot.order_manager    import OrderManager
-    from bot.webhook_server   import create_app, run_server
-    from bot.contract_utils   import get_front_month_symbol
+    from bot.tradovate_client    import TradovateClient, TradovateError
+    from bot.risk_manager        import RiskManager, ApexConfig
+    from bot.news_filter         import NewsFilter
+    from bot.session_filter      import SessionFilter, SessionConfig
+    from bot.order_manager       import OrderManager
+    from bot.webhook_server      import create_app, run_server
+    from bot.contract_utils      import get_front_month_symbol
+    from bot.market_data         import MarketDataFeed
+    from bot.order_flow_strategy import OrderFlowStrategy
 
     # ---- Tradovate credentials ------------------------------------
     username    = _req("TRADOVATE_USERNAME")
@@ -236,21 +249,72 @@ async def main():
     logger.info("Bot is running. Send alerts from TradingView to start trading.")
     logger.info("-" * 60)
 
-    # ---- Token refresh background task ---------------------------
-    async def token_refresh_loop():
-        while True:
-            await asyncio.sleep(3600)   # check every hour
-            try:
-                client.ensure_auth()
-            except TradovateError as e:
-                logger.error(f"Token refresh failed: {e}")
+    # ---- Order-flow autonomous trading --------------------------
+    order_flow_enabled = _bool("ORDER_FLOW_ENABLED", False)
+
+    tasks = [
+        risk_manager.monitor(),
+        _token_refresh_loop(client),
+        run_server(app, host=webhook_host, port=webhook_port),
+    ]
+
+    if order_flow_enabled:
+        logger.info("Order-flow autonomous trading: ENABLED")
+
+        # Resolve contract ID for WebSocket subscription
+        try:
+            contract_info = await asyncio.to_thread(client.find_contract, front_month)
+            contract_id   = contract_info.get("id", 0)
+            if not contract_id:
+                raise ValueError(f"find_contract returned no id for {front_month}")
+            logger.info(f"Order-flow contract: {front_month}  id={contract_id}")
+        except Exception as exc:
+            logger.error(
+                f"Could not resolve contract id for {front_month}: {exc}. "
+                f"Order-flow disabled."
+            )
+            contract_id = 0
+
+        if contract_id:
+            strategy = OrderFlowStrategy(
+                client               = client,
+                risk_manager         = risk_manager,
+                news_filter          = news_filter,
+                session_filter       = session_filter,
+                base_symbol          = symbol,
+                qty                  = _int("ORDER_FLOW_QTY", 1),
+                imbalance_ratio      = _float("ORDER_FLOW_IMBALANCE_RATIO", 3.0),
+                delta_min            = _float("ORDER_FLOW_DELTA_MIN", 50.0),
+                delta_lookback       = _int("ORDER_FLOW_DELTA_LOOKBACK", 30),
+                large_print_threshold= _int("ORDER_FLOW_LARGE_PRINT", 100),
+                dom_levels           = _int("ORDER_FLOW_DOM_LEVELS", 5),
+                cooldown_seconds     = _int("ORDER_FLOW_COOLDOWN", 30),
+            )
+
+            feed = MarketDataFeed(
+                md_token = client.md_access_token,
+                live     = live,
+            )
+            feed.on_dom   = strategy.on_dom_update
+            feed.on_quote = strategy.on_quote_update
+
+            tasks.append(feed.run(symbol=front_month, contract_id=contract_id))
+
+            logger.info(
+                f"Order-flow config — "
+                f"qty={strategy.qty}  "
+                f"imbalance={strategy.imbalance_ratio}:1  "
+                f"delta_min={strategy.delta_min:+.0f}  "
+                f"cooldown={strategy.cooldown_seconds}s"
+            )
+    else:
+        logger.info(
+            "Order-flow autonomous trading: DISABLED "
+            "(set ORDER_FLOW_ENABLED=true to enable)"
+        )
 
     # ---- Run everything concurrently ----------------------------
-    await asyncio.gather(
-        risk_manager.monitor(),
-        token_refresh_loop(),
-        run_server(app, host=webhook_host, port=webhook_port),
-    )
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
