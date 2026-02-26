@@ -15,12 +15,15 @@ Entry rules
   LONG  : bid_imbalance_ratio >= imbalance_ratio  AND  rolling_delta >= delta_min
   SHORT : ask_imbalance_ratio >= imbalance_ratio  AND  rolling_delta <= -delta_min
 
-No automatic exits — position management is handled manually or via the
-/flatten endpoint.  The existing session, news, and risk filters all still
-apply before any order is sent.
+Brackets placed immediately after every entry
+---------------------------------------------
+  Stop loss   : $300 (6 ES points) against the trade
+  Take profit : $600 (12 ES points) in favour of the trade  →  2:1 R:R
 
-Cooldown between signals is enforced via ``cooldown_seconds`` to avoid rapid
-re-entry on sustained imbalance.
+Session guards
+--------------
+  Daily profit cap : once realized + open P&L >= $1,000 no new entries are opened.
+  All existing session / news / risk-manager filters still apply.
 """
 
 import asyncio
@@ -36,35 +39,62 @@ from bot.news_filter import NewsFilter
 from bot.session_filter import SessionFilter
 from bot.contract_utils import get_front_month_symbol
 
+# ---------------------------------------------------------------------------
+# ES contract specs
+# ---------------------------------------------------------------------------
+
+ES_POINT_VALUE = 50.0   # USD per full index point
+ES_TICK_SIZE   = 0.25   # points per minimum price increment ($12.50 / tick)
+
+
+def _to_points(dollars: float) -> float:
+    """Convert a dollar P&L amount to ES index points."""
+    return dollars / ES_POINT_VALUE
+
+
+def _tick(price: float) -> float:
+    """Round an ES price to the nearest valid 0.25-point tick."""
+    return round(round(price / ES_TICK_SIZE) * ES_TICK_SIZE, 2)
+
+
+# ---------------------------------------------------------------------------
+# Strategy
+# ---------------------------------------------------------------------------
 
 class OrderFlowStrategy:
 
     def __init__(
         self,
-        client:              TradovateClient,
-        risk_manager:        RiskManager,
-        news_filter:         NewsFilter,
-        session_filter:      SessionFilter,
-        base_symbol:         str   = "ES",
-        qty:                 int   = 1,
-        imbalance_ratio:     float = 3.0,
-        delta_min:           float = 50.0,
-        delta_lookback:      int   = 30,
-        large_print_threshold: int = 100,
-        dom_levels:          int   = 5,
-        cooldown_seconds:    int   = 30,
+        client:                TradovateClient,
+        risk_manager:          RiskManager,
+        news_filter:           NewsFilter,
+        session_filter:        SessionFilter,
+        base_symbol:           str   = "ES",
+        qty:                   int   = 1,
+        imbalance_ratio:       float = 3.0,
+        delta_min:             float = 50.0,
+        delta_lookback:        int   = 30,
+        large_print_threshold: int   = 100,
+        dom_levels:            int   = 5,
+        cooldown_seconds:      int   = 30,
+        stop_loss_dollars:     float = 300.0,
+        take_profit_dollars:   float = 600.0,
+        daily_profit_cap:      float = 1_000.0,
     ):
-        self.client               = client
-        self.risk_manager         = risk_manager
-        self.news_filter          = news_filter
-        self.session_filter       = session_filter
-        self.base_symbol          = base_symbol
-        self.qty                  = qty
-        self.imbalance_ratio      = imbalance_ratio
-        self.delta_min            = delta_min
-        self.dom_levels           = dom_levels
+        self.client                = client
+        self.risk_manager          = risk_manager
+        self.news_filter           = news_filter
+        self.session_filter        = session_filter
+        self.base_symbol           = base_symbol
+        self.qty                   = qty
+        self.imbalance_ratio       = imbalance_ratio
+        self.delta_min             = delta_min
+        self.dom_levels            = dom_levels
         self.large_print_threshold = large_print_threshold
-        self.cooldown_seconds     = cooldown_seconds
+        self.cooldown_seconds      = cooldown_seconds
+        self.stop_loss_dollars     = stop_loss_dollars
+        self.take_profit_dollars   = take_profit_dollars
+        self.daily_profit_cap      = daily_profit_cap
 
         # Rolling delta window (each entry = signed trade size)
         self._delta_window: deque = deque(maxlen=delta_lookback)
@@ -104,7 +134,7 @@ class OrderFlowStrategy:
         if size == 0:
             return
 
-        # Update local bid/ask reference
+        # Keep local bid/ask reference up to date
         if quote.bid_price:
             self._last_bid = quote.bid_price
         if quote.ask_price:
@@ -172,6 +202,16 @@ class OrderFlowStrategy:
             if elapsed < self.cooldown_seconds:
                 return
 
+        # ---- daily profit cap ---------------------------------------
+        status      = self.risk_manager.get_status()
+        session_pnl = status["realized_pnl"] + status["unrealized_pnl"]
+        if session_pnl >= self.daily_profit_cap:
+            logger.info(
+                f"Daily profit cap ${self.daily_profit_cap:,.0f} reached "
+                f"(session P&L: ${session_pnl:,.2f}). No new entries."
+            )
+            return
+
         # ---- session filter -----------------------------------------
         allowed, reason = self.session_filter.is_trading_allowed()
         if not allowed:
@@ -209,11 +249,29 @@ class OrderFlowStrategy:
             await asyncio.to_thread(self.client.liquidate_position, symbol)
             await asyncio.sleep(0.5)
 
-        # ---- place order --------------------------------------------
+        # ---- compute bracket prices before sending entry ------------
+        #  Use last-known best ask for longs (lifted ask = expected fill)
+        #  Use last-known best bid for shorts (hit bid = expected fill)
+        ref         = self._last_ask if action == "buy" else self._last_bid
+        stop_pts    = _to_points(self.stop_loss_dollars)    # e.g. 6.0
+        tp_pts      = _to_points(self.take_profit_dollars)  # e.g. 12.0
+
+        if action == "buy":
+            stop_price = _tick(ref - stop_pts)
+            tp_price   = _tick(ref + tp_pts)
+            bracket_action = "Sell"
+        else:
+            stop_price = _tick(ref + stop_pts)
+            tp_price   = _tick(ref - tp_pts)
+            bracket_action = "Buy"
+
+        # ---- place entry order -------------------------------------
         tradovate_action = "Buy" if action == "buy" else "Sell"
         logger.info(
             f"ORDER FLOW ENTRY: {tradovate_action.upper()} {self.qty} {symbol}  "
-            f"[{display}]"
+            f"[{display}]  "
+            f"ref={ref:.2f}  SL={stop_price:.2f} (−${self.stop_loss_dollars:,.0f})  "
+            f"TP={tp_price:.2f} (+${self.take_profit_dollars:,.0f})"
         )
 
         try:
@@ -225,12 +283,61 @@ class OrderFlowStrategy:
                 f"OrderFlow-{action}",
             )
             logger.success(
-                f"Order flow order confirmed: {tradovate_action} {self.qty} "
-                f"{symbol} → {result}"
+                f"Entry confirmed: {tradovate_action} {self.qty} {symbol} → {result}"
             )
             self._last_entry_time = now
         except TradovateError as exc:
-            logger.error(f"Order flow order FAILED: {exc}")
+            logger.error(f"Order flow entry FAILED: {exc}")
+            return   # don't place brackets if entry failed
+
+        # ---- place stop loss + take profit concurrently -------------
+        asyncio.create_task(
+            self._place_brackets(bracket_action, symbol, stop_price, tp_price)
+        )
+
+    # ------------------------------------------------------------------
+    # Bracket helpers
+    # ------------------------------------------------------------------
+
+    async def _place_brackets(
+        self,
+        action:     str,
+        symbol:     str,
+        stop_price: float,
+        tp_price:   float,
+    ):
+        """Place stop loss and take profit concurrently after entry."""
+        await asyncio.gather(
+            self._place_stop(action, symbol, stop_price),
+            self._place_tp(action, symbol, tp_price),
+            return_exceptions=True,
+        )
+
+    async def _place_stop(self, action: str, symbol: str, price: float):
+        try:
+            await asyncio.to_thread(
+                self.client.place_stop_order,
+                action, symbol, self.qty, price, "OrderFlow-SL",
+            )
+            logger.info(
+                f"Stop loss placed: {action} {self.qty} {symbol} @ {price}  "
+                f"(risk ${self.stop_loss_dollars:,.0f})"
+            )
+        except TradovateError as exc:
+            logger.error(f"Stop loss order FAILED: {exc}")
+
+    async def _place_tp(self, action: str, symbol: str, price: float):
+        try:
+            await asyncio.to_thread(
+                self.client.place_limit_order,
+                action, symbol, self.qty, price, "OrderFlow-TP",
+            )
+            logger.info(
+                f"Take profit placed: {action} {self.qty} {symbol} @ {price}  "
+                f"(target ${self.take_profit_dollars:,.0f})"
+            )
+        except TradovateError as exc:
+            logger.error(f"Take profit order FAILED: {exc}")
 
     # ------------------------------------------------------------------
     # Helpers

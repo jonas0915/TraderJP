@@ -277,18 +277,21 @@ async def main():
 
         if contract_id:
             strategy = OrderFlowStrategy(
-                client               = client,
-                risk_manager         = risk_manager,
-                news_filter          = news_filter,
-                session_filter       = session_filter,
-                base_symbol          = symbol,
-                qty                  = _int("ORDER_FLOW_QTY", 1),
-                imbalance_ratio      = _float("ORDER_FLOW_IMBALANCE_RATIO", 3.0),
-                delta_min            = _float("ORDER_FLOW_DELTA_MIN", 50.0),
-                delta_lookback       = _int("ORDER_FLOW_DELTA_LOOKBACK", 30),
-                large_print_threshold= _int("ORDER_FLOW_LARGE_PRINT", 100),
-                dom_levels           = _int("ORDER_FLOW_DOM_LEVELS", 5),
-                cooldown_seconds     = _int("ORDER_FLOW_COOLDOWN", 30),
+                client                = client,
+                risk_manager          = risk_manager,
+                news_filter           = news_filter,
+                session_filter        = session_filter,
+                base_symbol           = symbol,
+                qty                   = _int(  "ORDER_FLOW_QTY",            1),
+                imbalance_ratio       = _float("ORDER_FLOW_IMBALANCE_RATIO", 3.0),
+                delta_min             = _float("ORDER_FLOW_DELTA_MIN",       50.0),
+                delta_lookback        = _int(  "ORDER_FLOW_DELTA_LOOKBACK",  30),
+                large_print_threshold = _int(  "ORDER_FLOW_LARGE_PRINT",     100),
+                dom_levels            = _int(  "ORDER_FLOW_DOM_LEVELS",       5),
+                cooldown_seconds      = _int(  "ORDER_FLOW_COOLDOWN",         30),
+                stop_loss_dollars     = _float("ORDER_FLOW_STOP_DOLLARS",  300.0),
+                take_profit_dollars   = _float("ORDER_FLOW_TP_DOLLARS",    600.0),
+                daily_profit_cap      = _float("ORDER_FLOW_DAILY_CAP",   1_000.0),
             )
 
             feed = MarketDataFeed(
@@ -305,7 +308,10 @@ async def main():
                 f"qty={strategy.qty}  "
                 f"imbalance={strategy.imbalance_ratio}:1  "
                 f"delta_min={strategy.delta_min:+.0f}  "
-                f"cooldown={strategy.cooldown_seconds}s"
+                f"cooldown={strategy.cooldown_seconds}s  "
+                f"SL=${strategy.stop_loss_dollars:,.0f}  "
+                f"TP=${strategy.take_profit_dollars:,.0f}  "
+                f"daily_cap=${strategy.daily_profit_cap:,.0f}"
             )
     else:
         logger.info(
