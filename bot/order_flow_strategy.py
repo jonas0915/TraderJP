@@ -106,6 +106,15 @@ class OrderFlowStrategy:
         # Timestamp of the last executed entry (for cooldown)
         self._last_entry_time: Optional[datetime] = None
 
+        # Consecutive DOM snapshot confirmations required before entry.
+        # Prevents single noisy snapshots from triggering trades.
+        self._signal_streak: dict = {"buy": 0, "sell": 0}
+        self._required_streak: int = 3
+
+        # Minimum number of prints required in the delta window before acting.
+        # Avoids trading on sparse data (e.g. first seconds after open).
+        self._min_window_fill: int = max(10, delta_lookback // 3)
+
     # ------------------------------------------------------------------
     # Callbacks wired to MarketDataFeed
     # ------------------------------------------------------------------
@@ -178,16 +187,31 @@ class OrderFlowStrategy:
         ratio         = total_bid / total_ask
         rolling_delta = sum(self._delta_window)
 
-        if ratio >= self.imbalance_ratio and rolling_delta >= self.delta_min:
+        long_signal  = ratio >= self.imbalance_ratio and rolling_delta >= self.delta_min
+        short_signal = ratio <= (1.0 / self.imbalance_ratio) and rolling_delta <= -self.delta_min
+
+        # Update streaks — signal must persist across consecutive DOM snapshots
+        # to filter out single noisy spikes.
+        if long_signal:
+            self._signal_streak["buy"]  += 1
+            self._signal_streak["sell"]  = 0
+        elif short_signal:
+            self._signal_streak["sell"] += 1
+            self._signal_streak["buy"]   = 0
+        else:
+            self._signal_streak["buy"]  = 0
+            self._signal_streak["sell"] = 0
+
+        if long_signal and self._signal_streak["buy"] >= self._required_streak:
             await self._try_entry(
                 action="buy",
-                display=f"bid/ask {ratio:.1f}:1 | delta {rolling_delta:+.0f}",
+                display=f"bid/ask {ratio:.1f}:1 | delta {rolling_delta:+.0f} | streak {self._signal_streak['buy']}",
             )
-        elif ratio <= (1.0 / self.imbalance_ratio) and rolling_delta <= -self.delta_min:
+        elif short_signal and self._signal_streak["sell"] >= self._required_streak:
             inv = 1.0 / ratio
             await self._try_entry(
                 action="sell",
-                display=f"ask/bid {inv:.1f}:1 | delta {rolling_delta:+.0f}",
+                display=f"ask/bid {inv:.1f}:1 | delta {rolling_delta:+.0f} | streak {self._signal_streak['sell']}",
             )
 
     # ------------------------------------------------------------------
@@ -222,6 +246,28 @@ class OrderFlowStrategy:
         blacked_out, _ = self.news_filter.is_news_blackout()
         if blacked_out:
             logger.debug("Order flow signal skipped (news blackout).")
+            return
+
+        # ---- signal quality filters ---------------------------------
+        if not self._window_filled():
+            logger.debug(
+                f"Order flow signal skipped: delta window only "
+                f"{len(self._delta_window)}/{self._min_window_fill} prints filled."
+            )
+            return
+
+        if not self._delta_accelerating(action):
+            logger.debug(
+                f"Order flow signal skipped ({action}): delta momentum fading — "
+                f"recent half of window not confirming direction."
+            )
+            return
+
+        if not self._spread_ok():
+            spread = round(self._last_ask - self._last_bid, 2)
+            logger.debug(
+                f"Order flow signal skipped: spread {spread:.2f} pts > 1 tick threshold."
+            )
             return
 
         # ---- risk check ---------------------------------------------
@@ -338,6 +384,39 @@ class OrderFlowStrategy:
             )
         except TradovateError as exc:
             logger.error(f"Take profit order FAILED: {exc}")
+
+    # ------------------------------------------------------------------
+    # Signal quality filters
+    # ------------------------------------------------------------------
+
+    def _delta_accelerating(self, direction: str) -> bool:
+        """
+        Check that momentum is still building, not fading.
+        Splits the delta window into two halves and confirms the recent half
+        has stronger directional flow than the earlier half.
+        """
+        window = list(self._delta_window)
+        if len(window) < self._min_window_fill:
+            return False
+        mid = len(window) // 2
+        early_delta  = sum(window[:mid])
+        recent_delta = sum(window[mid:])
+        if direction == "buy":
+            return recent_delta > 0 and recent_delta >= early_delta * 0.5
+        else:
+            return recent_delta < 0 and recent_delta <= early_delta * 0.5
+
+    def _spread_ok(self) -> bool:
+        """Block entries when the bid-ask spread is wider than 1 tick (0.25 pts).
+        Wide spreads mean higher slippage cost and lower-quality fills."""
+        if not self._last_bid or not self._last_ask:
+            return False
+        return (self._last_ask - self._last_bid) <= ES_TICK_SIZE
+
+    def _window_filled(self) -> bool:
+        """Require a minimum number of prints before acting to avoid
+        trading on sparse data at the open or after a gap."""
+        return len(self._delta_window) >= self._min_window_fill
 
     # ------------------------------------------------------------------
     # Helpers
