@@ -22,7 +22,7 @@ Brackets placed immediately after every entry
 
 Session guards
 --------------
-  Daily profit cap : once realized + open P&L >= $1,000 no new entries are opened.
+  Daily profit cap : once realized + open P&L >= $100 no new entries are opened.
   All existing session / news / risk-manager filters still apply.
 """
 
@@ -79,7 +79,7 @@ class OrderFlowStrategy:
         cooldown_seconds:      int   = 30,
         stop_loss_dollars:     float = 300.0,
         take_profit_dollars:   float = 600.0,
-        daily_profit_cap:      float = 1_000.0,
+        daily_profit_cap:      float = 100.0,
     ):
         self.client                = client
         self.risk_manager          = risk_manager

@@ -150,14 +150,14 @@ async def main():
 
     # ---- Apex risk config ----------------------------------------
     apex_cfg = ApexConfig(
-        account_size       = _float("APEX_ACCOUNT_SIZE",          100_000),
-        daily_loss_limit   = _float("APEX_DAILY_LOSS_LIMIT",        3_000),
-        max_trailing_dd    = _float("APEX_MAX_TRAILING_DRAWDOWN",    3_000),
-        profit_target      = _float("APEX_PROFIT_TARGET",            6_000),
-        max_contracts      = _int(  "APEX_MAX_CONTRACTS",                6),
-        consistency_rule   = _bool( "APEX_CONSISTENCY_RULE",         True),
+        account_size       = _float("APEX_ACCOUNT_SIZE",           50_000),
+        daily_loss_limit   = _float("APEX_DAILY_LOSS_LIMIT",          500),
+        max_trailing_dd    = _float("APEX_MAX_TRAILING_DRAWDOWN",    2_500),
+        profit_target      = _float("APEX_PROFIT_TARGET",            3_000),
+        max_contracts      = _int(  "APEX_MAX_CONTRACTS",                4),
+        consistency_rule   = _bool( "APEX_CONSISTENCY_RULE",        False),
         max_day_profit_pct = _float("APEX_MAX_DAY_PROFIT_PCT",        0.30),
-        eod_flatten_minutes= _int(  "APEX_EOD_FLATTEN_MINUTES",          0),
+        eod_flatten_minutes= _int(  "APEX_EOD_FLATTEN_MINUTES",          5),
         warning_threshold  = _float("APEX_WARNING_THRESHOLD",         0.80),
         poll_interval      = _int(  "RISK_POLL_INTERVAL",               10),
     )
@@ -291,7 +291,7 @@ async def main():
                 cooldown_seconds      = _int(  "ORDER_FLOW_COOLDOWN",         30),
                 stop_loss_dollars     = _float("ORDER_FLOW_STOP_DOLLARS",  300.0),
                 take_profit_dollars   = _float("ORDER_FLOW_TP_DOLLARS",    600.0),
-                daily_profit_cap      = _float("ORDER_FLOW_DAILY_CAP",   1_000.0),
+                daily_profit_cap      = _float("ORDER_FLOW_DAILY_CAP",     100.0),
             )
 
             feed = MarketDataFeed(

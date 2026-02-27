@@ -30,20 +30,20 @@ from bot.tradovate_client import TradovateClient, TradovateError
 @dataclass
 class ApexConfig:
     # Account size is informational only; limits are dollar values below
-    account_size:         float = 100_000.0
+    account_size:         float = 50_000.0
 
     # Hard limits ($). Bot flattens immediately when hit.
-    daily_loss_limit:     float = 3_000.0   # e.g. $3,000 for $100k account
-    max_trailing_dd:      float = 3_000.0   # trailing drawdown from equity peak
+    daily_loss_limit:     float = 500.0     # personal daily loss cap (Apex limit is $1,500)
+    max_trailing_dd:      float = 2_500.0   # trailing drawdown from equity peak ($50k PA)
 
-    # Profit target (for eval phase display only — bot doesn't stop when hit)
-    profit_target:        float = 6_000.0
+    # Profit target (informational — bot does NOT stop when hit)
+    profit_target:        float = 3_000.0
 
     # Position limits
-    max_contracts:        int   = 6          # max simultaneous contracts
+    max_contracts:        int   = 4          # max simultaneous contracts ($50k PA)
 
-    # Consistency rule: no single day > this fraction of cumulative net profit
-    consistency_rule:     bool  = True
+    # Consistency rule: eval only — disabled on Performance Accounts
+    consistency_rule:     bool  = False
     max_day_profit_pct:   float = 0.30       # 30%
 
     # Flatten X minutes before RTH close (0 = disabled)
