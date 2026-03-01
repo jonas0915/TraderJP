@@ -271,6 +271,56 @@ class TradovateClient:
         logger.info(f"Stop order placed: {action} {qty} {symbol} stop@{stop_price} → {result}")
         return result
 
+    def place_oso_order(
+        self,
+        action: str,
+        symbol: str,
+        qty: int,
+        stop_price: float,
+        tp_price: float,
+        comment: str = "TraderJP",
+    ) -> dict:
+        """
+        Place a market entry with an OCO bracket (stop-loss + take-profit).
+        When either bracket fills, Tradovate automatically cancels the other.
+        This replaces the old pattern of placing three separate independent orders.
+        """
+        bracket_action = "Sell" if action.capitalize() == "Buy" else "Buy"
+        payload = {
+            "entryOrder": {
+                "accountSpec":  self.account_spec,
+                "accountId":    self.account_id,
+                "clOrdId":      str(uuid.uuid4())[:16],
+                "action":       action.capitalize(),
+                "symbol":       symbol,
+                "orderQty":     qty,
+                "orderType":    "Market",
+                "timeInForce":  "Day",
+                "isAutomated":  True,
+                "text":         comment,
+            },
+            "brackets": [
+                {
+                    "qty":        qty,
+                    "orderType":  "Stop",
+                    "stopPrice":  stop_price,
+                    "action":     bracket_action,
+                },
+                {
+                    "qty":        qty,
+                    "orderType":  "Limit",
+                    "price":      tp_price,
+                    "action":     bracket_action,
+                },
+            ],
+        }
+        result = self._post("order/placeOSO", payload)
+        logger.info(
+            f"OSO order placed: {action} {qty} {symbol}  "
+            f"SL={stop_price}  TP={tp_price} → {result}"
+        )
+        return result
+
     def cancel_order(self, order_id: int) -> dict:
         result = self._post("order/cancelorder", {"orderId": order_id})
         logger.info(f"Order cancelled: {order_id}")

@@ -22,7 +22,7 @@ Brackets placed immediately after every entry
 
 Session guards
 --------------
-  Daily profit cap : once realized + open P&L >= $100 no new entries are opened.
+  Daily profit cap : once realized + open P&L >= daily_profit_cap no new entries are opened.
   All existing session / news / risk-manager filters still apply.
 """
 
@@ -319,11 +319,9 @@ class OrderFlowStrategy:
         if action == "buy":
             stop_price = _tick(ref - stop_pts)
             tp_price   = _tick(ref + tp_pts)
-            bracket_action = "Sell"
         else:
             stop_price = _tick(ref + stop_pts)
             tp_price   = _tick(ref - tp_pts)
-            bracket_action = "Buy"
 
         # ---- sanity-check bracket prices before touching the exchange ----
         if ref <= 0 or stop_price <= 0 or tp_price <= 0:
@@ -345,7 +343,7 @@ class OrderFlowStrategy:
             )
             return
 
-        # ---- place entry order -------------------------------------
+        # ---- place OSO entry + OCO brackets (atomic) ---------------
         tradovate_action = "Buy" if action == "buy" else "Sell"
         logger.info(
             f"ORDER FLOW ENTRY: {tradovate_action.upper()} {self.qty} {symbol}  "
@@ -356,68 +354,21 @@ class OrderFlowStrategy:
 
         try:
             result = await asyncio.to_thread(
-                self.client.place_market_order,
+                self.client.place_oso_order,
                 tradovate_action,
                 symbol,
                 self.qty,
+                stop_price,
+                tp_price,
                 f"OrderFlow-{action}",
             )
             logger.success(
-                f"Entry confirmed: {tradovate_action} {self.qty} {symbol} → {result}"
+                f"OSO entry confirmed: {tradovate_action} {self.qty} {symbol}  "
+                f"SL={stop_price:.2f}  TP={tp_price:.2f} → {result}"
             )
             self._last_entry_time = now
         except TradovateError as exc:
-            logger.error(f"Order flow entry FAILED: {exc}")
-            return   # don't place brackets if entry failed
-
-        # ---- place stop loss + take profit concurrently -------------
-        asyncio.create_task(
-            self._place_brackets(bracket_action, symbol, stop_price, tp_price)
-        )
-
-    # ------------------------------------------------------------------
-    # Bracket helpers
-    # ------------------------------------------------------------------
-
-    async def _place_brackets(
-        self,
-        action:     str,
-        symbol:     str,
-        stop_price: float,
-        tp_price:   float,
-    ):
-        """Place stop loss and take profit concurrently after entry."""
-        await asyncio.gather(
-            self._place_stop(action, symbol, stop_price),
-            self._place_tp(action, symbol, tp_price),
-            return_exceptions=True,
-        )
-
-    async def _place_stop(self, action: str, symbol: str, price: float):
-        try:
-            await asyncio.to_thread(
-                self.client.place_stop_order,
-                action, symbol, self.qty, price, "OrderFlow-SL",
-            )
-            logger.info(
-                f"Stop loss placed: {action} {self.qty} {symbol} @ {price}  "
-                f"(risk ${self.stop_loss_dollars:,.0f})"
-            )
-        except TradovateError as exc:
-            logger.error(f"Stop loss order FAILED: {exc}")
-
-    async def _place_tp(self, action: str, symbol: str, price: float):
-        try:
-            await asyncio.to_thread(
-                self.client.place_limit_order,
-                action, symbol, self.qty, price, "OrderFlow-TP",
-            )
-            logger.info(
-                f"Take profit placed: {action} {self.qty} {symbol} @ {price}  "
-                f"(target ${self.take_profit_dollars:,.0f})"
-            )
-        except TradovateError as exc:
-            logger.error(f"Take profit order FAILED: {exc}")
+            logger.error(f"Order flow OSO entry FAILED: {exc}")
 
     # ------------------------------------------------------------------
     # Signal quality filters
@@ -477,7 +428,5 @@ class OrderFlowStrategy:
 
         for pos in positions:
             if pos.get("symbol", "") == symbol:
-                return pos.get("netPos", 0)
-            if symbol in str(pos.get("contractId", "")):
                 return pos.get("netPos", 0)
         return 0
