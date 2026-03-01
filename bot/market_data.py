@@ -132,7 +132,9 @@ class MarketDataFeed:
                 await ws.send("[]")
             except Exception as exc:
                 logger.warning(f"MarketDataFeed heartbeat failed: {exc}")
-                break
+                # Raise so asyncio.gather cancels the sibling receive_loop and
+                # _connect_and_stream returns, triggering a clean reconnect.
+                raise
 
     async def _receive_loop(self, ws):
         """Read frames and dispatch to handlers."""
@@ -182,16 +184,27 @@ class MarketDataFeed:
     async def _dispatch_quote(self, data: dict):
         if not self.on_quote:
             return
-        entries = data.get("entries", {})
-        bid     = entries.get("Bid",   {})
-        ask     = entries.get("Ask",   {})
-        trade   = entries.get("Trade", {})
+        entries    = data.get("entries", {})
+        bid        = entries.get("Bid",   {})
+        ask        = entries.get("Ask",   {})
+        trade      = entries.get("Trade", {})
+        bid_price  = bid.get("price",   0.0)
+        ask_price  = ask.get("price",   0.0)
+
+        # Reject updates with missing or crossed prices — these appear at feed
+        # startup before the exchange sends a full snapshot and must not be fed
+        # to the delta classifier, which would corrupt the rolling delta window.
+        if bid_price <= 0 or ask_price <= 0:
+            return
+        if bid_price >= ask_price:
+            return   # crossed market — stale or malformed frame
+
         quote = QuoteUpdate(
             contract_id = data.get("contractId", 0),
             timestamp   = data.get("timestamp", ""),
-            bid_price   = bid.get("price",   0.0),
+            bid_price   = bid_price,
             bid_size    = bid.get("size",    0),
-            ask_price   = ask.get("price",   0.0),
+            ask_price   = ask_price,
             ask_size    = ask.get("size",    0),
             trade_price = trade.get("price", 0.0),
             trade_size  = trade.get("size",  0),

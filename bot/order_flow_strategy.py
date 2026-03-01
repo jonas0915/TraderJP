@@ -187,8 +187,22 @@ class OrderFlowStrategy:
         ratio         = total_bid / total_ask
         rolling_delta = sum(self._delta_window)
 
-        long_signal  = ratio >= self.imbalance_ratio and rolling_delta >= self.delta_min
-        short_signal = ratio <= (1.0 / self.imbalance_ratio) and rolling_delta <= -self.delta_min
+        # Require a minimum number of trade prints in the window before any
+        # signal can build a streak.  Without this guard, the streak counter
+        # climbs on the very first DOM snapshots after startup when the delta
+        # window holds only 0–9 prints — far too sparse to be meaningful.
+        window_ready = len(self._delta_window) >= self._min_window_fill
+
+        long_signal  = (
+            window_ready
+            and ratio >= self.imbalance_ratio
+            and rolling_delta >= self.delta_min
+        )
+        short_signal = (
+            window_ready
+            and ratio <= (1.0 / self.imbalance_ratio)
+            and rolling_delta <= -self.delta_min
+        )
 
         # Update streaks — signal must persist across consecutive DOM snapshots
         # to filter out single noisy spikes.
@@ -311,6 +325,26 @@ class OrderFlowStrategy:
             tp_price   = _tick(ref - tp_pts)
             bracket_action = "Buy"
 
+        # ---- sanity-check bracket prices before touching the exchange ----
+        if ref <= 0 or stop_price <= 0 or tp_price <= 0:
+            logger.error(
+                f"Invalid bracket prices (ref={ref}, stop={stop_price}, "
+                f"tp={tp_price}). Skipping entry."
+            )
+            return
+        if action == "buy" and not (stop_price < ref < tp_price):
+            logger.error(
+                f"BUY bracket prices out of order — "
+                f"stop={stop_price} ref={ref} tp={tp_price}. Skipping."
+            )
+            return
+        if action == "sell" and not (tp_price < ref < stop_price):
+            logger.error(
+                f"SELL bracket prices out of order — "
+                f"tp={tp_price} ref={ref} stop={stop_price}. Skipping."
+            )
+            return
+
         # ---- place entry order -------------------------------------
         tradovate_action = "Buy" if action == "buy" else "Sell"
         logger.info(
@@ -402,9 +436,20 @@ class OrderFlowStrategy:
         early_delta  = sum(window[:mid])
         recent_delta = sum(window[mid:])
         if direction == "buy":
-            return recent_delta > 0 and recent_delta >= early_delta * 0.5
+            if recent_delta <= 0:
+                return False   # recent flow is not bullish at all
+            # If early delta was flat or bearish, all the bullish flow is
+            # concentrated in the recent half — that's a valid acceleration.
+            if early_delta <= 0:
+                return True
+            return recent_delta >= early_delta * 0.5
         else:
-            return recent_delta < 0 and recent_delta <= early_delta * 0.5
+            if recent_delta >= 0:
+                return False   # recent flow is not bearish at all
+            # All bearish flow concentrated in recent half — valid acceleration.
+            if early_delta >= 0:
+                return True
+            return recent_delta <= early_delta * 0.5
 
     def _spread_ok(self) -> bool:
         """Block entries when the bid-ask spread is wider than 1 tick (0.25 pts).

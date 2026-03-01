@@ -12,15 +12,21 @@ The monitor() coroutine should be run as a background asyncio task.
 """
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, date
+from pathlib import Path
 from typing import Callable, Optional
 
 import pytz
 from loguru import logger
 
 from bot.tradovate_client import TradovateClient, TradovateError
+
+# Persisted across restarts so a bot restart mid-drawdown cannot reset the
+# all-time equity peak and falsely permit more drawdown than Apex allows.
+_PEAK_STATE_FILE = Path("logs/risk_state.json")
 
 
 # ------------------------------------------------------------------
@@ -90,9 +96,10 @@ class RiskManager:
         self._day     = DayStats()
         self._running = False
 
-        # All-time peak equity (for trailing drawdown)
-        # We'll seed this from the starting balance on first poll
-        self._peak_equity: float = 0.0
+        # All-time peak equity (for trailing drawdown).
+        # Loaded from disk so a mid-session restart cannot reset the high-water
+        # mark and allow a drawdown violation to go undetected.
+        self._peak_equity: float = self._load_peak_equity()
         self._initialized: bool  = False
 
         # Cumulative net profit across days (for consistency rule)
@@ -209,20 +216,26 @@ class RiskManager:
 
         current_equity = cash_balance + open_pnl
 
-        # Seed on first poll
+        # Seed on first poll after startup (or after a new-day reset)
         if not self._initialized:
             self._day.starting_balance = cash_balance - day_pnl  # strip today's realised
-            self._peak_equity          = current_equity
-            self._initialized          = True
+            # Only seed peak from live equity if no persisted value exists.
+            # A persisted value means we restarted mid-session and must honour
+            # the previous high-water mark, not reset it.
+            if self._peak_equity == 0.0:
+                self._peak_equity = current_equity
+                self._save_peak_equity()
+            self._initialized = True
             logger.info(
                 f"Risk manager initialised. Starting balance: "
                 f"${self._day.starting_balance:,.2f}, "
-                f"Peak equity: ${self._peak_equity:,.2f}"
+                f"Peak equity (all-time): ${self._peak_equity:,.2f}"
             )
 
-        # Update trailing peak
+        # Update trailing peak and persist whenever it moves higher
         if current_equity > self._peak_equity:
             self._peak_equity = current_equity
+            self._save_peak_equity()
 
         daily_loss  = self._current_daily_loss()
         trailing_dd = self._current_trailing_dd()
@@ -258,6 +271,34 @@ class RiskManager:
         # EOD flatten
         if self.config.eod_flatten_minutes > 0 and not self._day.flattened_today:
             self._check_eod_flatten()
+
+    # ------------------------------------------------------------------
+    # Peak equity persistence
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_peak_equity() -> float:
+        """Return persisted peak equity, or 0.0 if no state file exists."""
+        try:
+            if _PEAK_STATE_FILE.exists():
+                data = json.loads(_PEAK_STATE_FILE.read_text())
+                val = float(data.get("peak_equity", 0.0))
+                if val > 0:
+                    logger.info(f"Loaded persisted peak equity: ${val:,.2f}")
+                return val
+        except Exception as e:
+            logger.warning(f"Could not load peak equity state: {e}")
+        return 0.0
+
+    def _save_peak_equity(self):
+        """Persist current peak equity to survive restarts."""
+        try:
+            _PEAK_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _PEAK_STATE_FILE.write_text(
+                json.dumps({"peak_equity": round(self._peak_equity, 2)})
+            )
+        except Exception as e:
+            logger.error(f"Could not persist peak equity: {e}")
 
     def _current_daily_loss(self) -> float:
         """Positive value = how much we've lost today (including open P&L)."""

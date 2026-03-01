@@ -17,12 +17,28 @@ Usage:
 
 import asyncio
 import os
+import signal as _signal
 import sys
 import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
 from loguru import logger
+
+_DEVICE_ID_FILE = Path(".device_id")
+
+
+def _get_or_create_device_id(override: str) -> str:
+    """Return a stable device ID across restarts to avoid Tradovate session conflicts."""
+    if override:
+        return override
+    if _DEVICE_ID_FILE.exists():
+        saved = _DEVICE_ID_FILE.read_text().strip()
+        if saved:
+            return saved
+    new_id = f"TraderJP-{uuid.uuid4().hex[:8]}"
+    _DEVICE_ID_FILE.write_text(new_id)
+    return new_id
 
 # Load .env before importing any bot modules so env vars are available
 env_path = Path(__file__).parent / ".env"
@@ -105,12 +121,17 @@ def _float(key: str, default: float = 0.0) -> float:
 # ------------------------------------------------------------------
 
 async def _token_refresh_loop(client):
-    """Hourly token-refresh task (module-level so it can be passed to gather)."""
+    """Check token every 15 min; re-authenticate if near expiry (tokens last 24 h).
+
+    The old 1-hour sleep was a bug: with a 23 h 55 min expiry window and hourly
+    checks, the last check before expiry could miss the refresh window by up to
+    55 minutes, leaving all subsequent API calls unauthenticated.
+    """
     from bot.tradovate_client import TradovateError
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(900)   # 15-minute check interval
         try:
-            client.ensure_auth()
+            client.ensure_auth()   # no-op unless token is within 5 min of expiry
         except TradovateError as e:
             logger.error(f"Token refresh failed: {e}")
 
@@ -135,7 +156,7 @@ async def main():
     # ---- Tradovate credentials ------------------------------------
     username    = _req("TRADOVATE_USERNAME")
     password    = _req("TRADOVATE_PASSWORD")
-    device_id   = _opt("TRADOVATE_DEVICE_ID") or f"TraderJP-{uuid.uuid4().hex[:8]}"
+    device_id   = _get_or_create_device_id(_opt("TRADOVATE_DEVICE_ID"))
     cid         = _int("TRADOVATE_CID", 0)
     secret      = _opt("TRADOVATE_SECRET", "")
     live        = _bool("TRADOVATE_LIVE", True)
@@ -283,15 +304,15 @@ async def main():
                 session_filter        = session_filter,
                 base_symbol           = symbol,
                 qty                   = _int(  "ORDER_FLOW_QTY",            1),
-                imbalance_ratio       = _float("ORDER_FLOW_IMBALANCE_RATIO", 3.0),
-                delta_min             = _float("ORDER_FLOW_DELTA_MIN",       50.0),
+                imbalance_ratio       = _float("ORDER_FLOW_IMBALANCE_RATIO", 4.0),
+                delta_min             = _float("ORDER_FLOW_DELTA_MIN",       75.0),
                 delta_lookback        = _int(  "ORDER_FLOW_DELTA_LOOKBACK",  30),
                 large_print_threshold = _int(  "ORDER_FLOW_LARGE_PRINT",     100),
                 dom_levels            = _int(  "ORDER_FLOW_DOM_LEVELS",       5),
-                cooldown_seconds      = _int(  "ORDER_FLOW_COOLDOWN",         30),
+                cooldown_seconds      = _int(  "ORDER_FLOW_COOLDOWN",         60),
                 stop_loss_dollars     = _float("ORDER_FLOW_STOP_DOLLARS",  300.0),
                 take_profit_dollars   = _float("ORDER_FLOW_TP_DOLLARS",    600.0),
-                daily_profit_cap      = _float("ORDER_FLOW_DAILY_CAP",     100.0),
+                daily_profit_cap      = _float("ORDER_FLOW_DAILY_CAP",    1000.0),
             )
 
             feed = MarketDataFeed(
@@ -319,12 +340,46 @@ async def main():
             "(set ORDER_FLOW_ENABLED=true to enable)"
         )
 
+    # ---- Graceful shutdown via SIGINT / SIGTERM -----------------
+    loop             = asyncio.get_event_loop()
+    _shutdown_event  = asyncio.Event()
+
+    def _request_shutdown():
+        if not _shutdown_event.is_set():
+            logger.warning("Shutdown signal received — stopping bot and flattening positions...")
+            _shutdown_event.set()
+
+    for sig in (_signal.SIGINT, _signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown)
+        except (NotImplementedError, OSError):
+            pass  # Windows does not support add_signal_handler
+
     # ---- Run everything concurrently ----------------------------
-    await asyncio.gather(*tasks)
+    task_futures = [asyncio.ensure_future(t) for t in tasks]
+    shutdown_future = asyncio.ensure_future(_shutdown_event.wait())
+
+    try:
+        done, pending = await asyncio.wait(
+            [*task_futures, shutdown_future],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        # Cancel remaining tasks on any completion (shutdown or error)
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    finally:
+        logger.warning("Flattening all positions on shutdown...")
+        try:
+            client.flatten_all()
+            logger.info("Shutdown flatten complete.")
+        except Exception as exc:
+            logger.error(f"Could not flatten positions on shutdown: {exc}")
+        logger.info("Bot stopped.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user (Ctrl+C).")
+        pass   # graceful shutdown already handled inside main()

@@ -146,9 +146,18 @@ class TradovateClient:
     # ------------------------------------------------------------------
 
     def get_accounts(self) -> list:
+        # Called from _load_account() which is called from authenticate(), so
+        # _headers() cannot be used here (it would create a recursive auth
+        # loop).  The access_token is always valid at this call site because
+        # authenticate() sets it moments before calling _load_account().
+        if not self.access_token:
+            raise TradovateError("get_accounts: not authenticated yet.")
         resp = requests.get(
             f"{self.base_url}/account/list",
-            headers={"Authorization": f"Bearer {self.access_token}"},
+            headers={
+                "Authorization": f"Bearer {self.access_token}",
+                "Content-Type": "application/json",
+            },
             timeout=15,
         )
         self._check_response(resp, "account/list")
@@ -160,16 +169,6 @@ class TradovateClient:
             "cashbalance/getcashbalancesnapshot",
             {"accountId": self.account_id},
         )
-
-    def get_account_risk_status(self) -> dict:
-        """Tradovate's built-in risk status (if available on account)."""
-        try:
-            return self._post(
-                "useraccountriskparameter/list",
-                {"accountId": self.account_id},
-            )
-        except TradovateError:
-            return {}
 
     # ------------------------------------------------------------------
     # Positions & Orders

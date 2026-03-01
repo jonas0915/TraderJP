@@ -35,6 +35,8 @@ Simpler version (hard-coded):
 """
 
 import os
+import time
+from collections import defaultdict
 from datetime import datetime
 from typing import Optional
 
@@ -49,6 +51,23 @@ from bot.order_manager import OrderManager, TradeSignal
 from bot.risk_manager import RiskManager
 from bot.news_filter import NewsFilter
 from bot.session_filter import SessionFilter
+
+# ---------------------------------------------------------------------------
+# Simple in-memory rate limiter (per source IP, for the /webhook endpoint)
+# ---------------------------------------------------------------------------
+_RATE_LIMIT_MAX    = 10    # max requests per window
+_RATE_LIMIT_WINDOW = 60   # seconds
+_rate_store: dict = defaultdict(list)
+
+def _check_rate_limit(ip: str) -> bool:
+    """Return True if the request is within the allowed rate, False otherwise."""
+    now = time.monotonic()
+    timestamps = _rate_store[ip]
+    timestamps[:] = [t for t in timestamps if now - t < _RATE_LIMIT_WINDOW]
+    if len(timestamps) >= _RATE_LIMIT_MAX:
+        return False
+    timestamps.append(now)
+    return True
 
 
 # ------------------------------------------------------------------
@@ -105,6 +124,12 @@ def create_app(
 
     @app.post("/webhook")
     async def webhook(payload: WebhookPayload, request: Request):
+        # Rate limit — 10 requests per 60 s per source IP
+        client_ip = request.client.host if request.client else "unknown"
+        if not _check_rate_limit(client_ip):
+            logger.warning(f"Webhook rate limit exceeded from {client_ip}")
+            raise HTTPException(status_code=429, detail="Rate limit exceeded. Slow down.")
+
         # Validate secret
         if payload.secret != webhook_secret:
             logger.warning(
@@ -214,7 +239,16 @@ def create_app(
 
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        import asyncio
+        from bot.tradovate_client import TradovateError
+        try:
+            await asyncio.to_thread(order_manager.client.ensure_auth)
+            return {"status": "ok", "tradovate": "connected"}
+        except TradovateError as e:
+            return JSONResponse(
+                content={"status": "degraded", "tradovate": str(e)},
+                status_code=503,
+            )
 
     return app
 

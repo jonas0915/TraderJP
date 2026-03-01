@@ -113,13 +113,21 @@ class NewsFilter:
 
     def _maybe_refresh(self):
         now = datetime.now(self.UTC)
+        # Set _last_refresh inside the lock (before the HTTP call) so that a
+        # second concurrent caller sees a non-None value and skips the refresh.
+        # This avoids hammering the endpoint when multiple threads arrive
+        # simultaneously and ensures the lock is held only for microseconds
+        # rather than the full duration of the network request.
+        should_refresh = False
         with self._lock:
             if (
                 self._last_refresh is None
                 or (now - self._last_refresh).total_seconds() > self.refresh_interval
             ):
-                self._refresh_calendar()
-                self._last_refresh = now
+                self._last_refresh = now   # claim the refresh slot immediately
+                should_refresh = True
+        if should_refresh:
+            self._refresh_calendar()
 
     def _refresh_calendar(self):
         """Fetch and parse the ForexFactory calendar JSON."""

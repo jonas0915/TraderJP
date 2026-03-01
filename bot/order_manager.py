@@ -236,9 +236,10 @@ class OrderManager:
             return 0
 
         for pos in positions:
-            if pos.get("contractId") and symbol in str(pos.get("contractId", "")):
-                return pos.get("netPos", 0)
-            # Tradovate may also return the symbol directly
+            # Match on the symbol field (most reliable — Tradovate always
+            # includes it in the position/list response).  The old substring
+            # check against contractId (an integer) could accidentally match
+            # unrelated contracts whose numeric ID contains the symbol digits.
             if pos.get("symbol", "") == symbol:
                 return pos.get("netPos", 0)
         return 0
