@@ -162,6 +162,15 @@ async def main():
     live        = _bool("TRADOVATE_LIVE", True)
     account_name = _opt("TRADOVATE_ACCOUNT_NAME", "")
 
+    # Validate that username looks like an email address (Tradovate requires email login)
+    if "@" not in username:
+        logger.error(
+            f"TRADOVATE_USERNAME='{username}' does not look like an email address. "
+            "Tradovate requires your registered EMAIL as the username — not an account ID. "
+            "Update .env with your email address (e.g. john@example.com) and restart."
+        )
+        sys.exit(1)
+
     env_label = "LIVE" if live else "DEMO"
     logger.info(f"Tradovate mode: {env_label}")
     if not live:
