@@ -163,30 +163,33 @@ def generate_signals(
     """
     rng = random.Random(seed + 1000)
 
-    # How many raw signals to attempt (after cooldown ~60s → 1 per 1 min floor)
+    # Signals per day — more generous counts so trades spread across the session
     if "Trending" in regime:
-        n_signals = rng.randint(7, 11)
+        n_signals = rng.randint(10, 14)
     elif "Volatile" in regime:
-        n_signals = rng.randint(3, 6)
+        n_signals = rng.randint(7, 10)
     else:
-        n_signals = rng.randint(4, 7)
+        n_signals = rng.randint(8, 12)
 
     # Usable minute window (skip first 10 min and last 15 min of RTH)
+    # RTH = ~405 min total → usable ≈ 380 minutes
     usable = list(range(10, len(prices) - 15))
     if len(usable) < n_signals * 2:
         return []
 
-    # Space out signal candidates with at least cooldown gap
-    min_gap = COOLDOWN_SECONDS // 60 + 1
+    # Spread signals across the day with a minimum 20-min gap between them.
+    # Iterate through the *shuffled* pool so they land at random times, not
+    # all bunched at the open.  (Previous bug: sorted(pool) undid the shuffle.)
+    min_gap = 20   # minutes — realistic between qualifying DOM setups
     candidates: List[int] = []
     pool = usable[:]
     rng.shuffle(pool)
-    for minute in sorted(pool):
+    for minute in pool:          # ← shuffled order, NOT sorted
         if all(abs(minute - c) >= min_gap for c in candidates):
             candidates.append(minute)
         if len(candidates) >= n_signals:
             break
-    candidates.sort()
+    candidates.sort()            # sort only for chronological log output
 
     signals: List[Signal] = []
     for i in candidates:
