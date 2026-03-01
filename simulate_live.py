@@ -1,18 +1,18 @@
 """
-TraderJP — 5-Day Live Trade Simulation
-=======================================
-Simulates 5 real trading days (Feb 2–6 2026) trade-by-trade with:
-  - Realistic ES minute-bar price path (GBM + intraday pattern)
+TraderJP — Full Month Live Trade Simulation
+============================================
+Simulates all 21 trading days in March 2026 trade-by-trade with:
+  - Realistic ES minute-bar price path (GBM + intraday structure)
   - Bot-style log output matching what you'd see in the terminal
   - Exact entry/SL/TP prices, timestamps, trade duration
-  - Running P&L and end-of-day summaries
-  - All Apex risk guards applied in real time
+  - Contract rollover: ESH6 → ESM6 on Mar 13 (5 days before Mar expiry)
+  - FOMC week (Mar 16-20) modelled as elevated volatility
+  - Weekly summaries + monthly summary with Apex progress
 
 Usage:
     python3 simulate_live.py
 """
 
-import math
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -23,199 +23,152 @@ from typing import List, Optional, Tuple
 # ─────────────────────────────────────────────────────────────
 
 STARTING_BALANCE   = 50_000.0
-TP_DOLLARS         = 600.0        # +12 ES pts
-SL_DOLLARS         = 300.0        # −6 ES pts
+TP_DOLLARS         = 600.0
+SL_DOLLARS         = 300.0
 ES_POINT_VALUE     = 50.0
 ES_TICK            = 0.25
-TP_POINTS          = TP_DOLLARS / ES_POINT_VALUE   # 12.0
-SL_POINTS          = SL_DOLLARS / ES_POINT_VALUE   # 6.0
+TP_POINTS          = TP_DOLLARS / ES_POINT_VALUE   # 12.0 pts
+SL_POINTS          = SL_DOLLARS / ES_POINT_VALUE   #  6.0 pts
 DAILY_LOSS_LIMIT   = 500.0
 DAILY_PROFIT_CAP   = 1_000.0
 MAX_TRAILING_DD    = 2_500.0
 COOLDOWN_SECONDS   = 60
-EOD_FLATTEN_MIN    = 5            # flatten 5 min before 15:15 CT
-CONTRACT           = "ESH6"       # March 2026 front month
-BASE_PRICE         = 6_052.00     # ~ES level early Feb 2026
+BASE_PRICE         = 6_050.00    # ES level entering March 2026
 
-# RTH  08:30 → 15:10 CT  (stop entries 5 min before 15:15 close)
-RTH_OPEN_MIN  =  8 * 60 + 30   #  510 min from midnight
-RTH_CLOSE_MIN = 15 * 60 + 10   #  910 min (last entry window)
+RTH_OPEN_MIN  =  8 * 60 + 30    # 510
+RTH_CLOSE_MIN = 15 * 60 + 10    # 910 — last entry 5 min before RTH close
 
 # ─────────────────────────────────────────────────────────────
-# 5 trading days with individual market characters
+# March 2026 — 21 trading days
+# Contract: ESH6 through Mar 12, ESM6 from Mar 13 (roll day)
+# FOMC:     March 18 decision day
+# ES expiry: March 20 (triple witching)
 # ─────────────────────────────────────────────────────────────
 
 @dataclass
 class DayProfile:
-    label:        str
-    date_str:     str          # "2026-02-XX"
-    daily_drift:  float        # net point move over the day (positive = up)
-    volatility:   float        # intraday σ per minute (pts)
-    regime:       str          # "Trending" / "Choppy" / "Volatile"
-    win_rate:     float        # signal quality for this day
+    label:       str
+    date_str:    str     # "2026-03-DD"
+    contract:    str     # "ESH6" or "ESM6"
+    daily_drift: float   # net point move expected over the session
+    volatility:  float   # intraday σ per minute
+    regime:      str
+    win_rate:    float
+    note:        str = ""
 
 DAYS = [
-    DayProfile("Monday   Feb 02", "2026-02-02",
-               daily_drift=+18.0, volatility=0.55, regime="Trending ↑", win_rate=0.55),
-    DayProfile("Tuesday  Feb 03", "2026-02-03",
-               daily_drift= -6.0, volatility=0.80, regime="Volatile  ↕", win_rate=0.38),
-    DayProfile("Wednesday Feb 04","2026-02-04",
-               daily_drift= +4.0, volatility=0.40, regime="Choppy    ↔", win_rate=0.43),
-    DayProfile("Thursday Feb 05", "2026-02-05",
-               daily_drift=-22.0, volatility=0.65, regime="Trending ↓", win_rate=0.52),
-    DayProfile("Friday   Feb 06", "2026-02-06",
-               daily_drift= +8.0, volatility=0.45, regime="Choppy    ↔", win_rate=0.45),
+    # ── Week 1 ─────────────────────────────────────────────────────
+    DayProfile("Mon Mar 02","2026-03-02","ESH6", +12.0,0.45,"Choppy    ↔",0.43),
+    DayProfile("Tue Mar 03","2026-03-03","ESH6", +24.0,0.55,"Trending ↑",0.54),
+    DayProfile("Wed Mar 04","2026-03-04","ESH6",  -9.0,0.75,"Volatile  ↕",0.38),
+    DayProfile("Thu Mar 05","2026-03-05","ESH6",  +6.0,0.42,"Choppy    ↔",0.44),
+    DayProfile("Fri Mar 06","2026-03-06","ESH6", -20.0,0.62,"Trending ↓",0.51, "NFP"),
+    # ── Week 2  (rollover week) ────────────────────────────────────
+    DayProfile("Mon Mar 09","2026-03-09","ESH6", -14.0,0.58,"Trending ↓",0.50),
+    DayProfile("Tue Mar 10","2026-03-10","ESH6",  +9.0,0.48,"Choppy    ↔",0.43),
+    DayProfile("Wed Mar 11","2026-03-11","ESH6", -26.0,0.90,"Volatile  ↕",0.36, "CPI"),
+    DayProfile("Thu Mar 12","2026-03-12","ESH6", +21.0,0.65,"Trending ↑",0.53),
+    DayProfile("Fri Mar 13","2026-03-13","ESM6",  +3.0,0.44,"Choppy    ↔",0.44, "ROLL→ESM6"),
+    # ── Week 3  (FOMC week + ES expiry) ───────────────────────────
+    DayProfile("Mon Mar 16","2026-03-16","ESM6", +16.0,0.50,"Trending ↑",0.54),
+    DayProfile("Tue Mar 17","2026-03-17","ESM6",  +4.0,0.46,"Choppy    ↔",0.43, "FOMC eve"),
+    DayProfile("Wed Mar 18","2026-03-18","ESM6", -32.0,1.10,"Volatile  ↕",0.34, "FOMC day"),
+    DayProfile("Thu Mar 19","2026-03-19","ESM6", +22.0,0.68,"Trending ↑",0.55, "Post-FOMC"),
+    DayProfile("Fri Mar 20","2026-03-20","ESM6",  -6.0,0.60,"Choppy    ↔",0.42, "Triple witch"),
+    # ── Week 4 ─────────────────────────────────────────────────────
+    DayProfile("Mon Mar 23","2026-03-23","ESM6", -13.0,0.52,"Trending ↓",0.50),
+    DayProfile("Tue Mar 24","2026-03-24","ESM6",  +7.0,0.44,"Choppy    ↔",0.44),
+    DayProfile("Wed Mar 25","2026-03-25","ESM6", +18.0,0.55,"Trending ↑",0.53),
+    DayProfile("Thu Mar 26","2026-03-26","ESM6",  -4.0,0.47,"Choppy    ↔",0.43),
+    # ── Week 5  (month-end) ────────────────────────────────────────
+    DayProfile("Mon Mar 30","2026-03-30","ESM6",  +8.0,0.46,"Trending ↑",0.52),
+    DayProfile("Tue Mar 31","2026-03-31","ESM6", -11.0,0.70,"Volatile  ↕",0.39, "Month-end"),
+]
+
+WEEK_LABELS = [
+    "Week 1  Mar 02–06",
+    "Week 2  Mar 09–13  (Rollover)",
+    "Week 3  Mar 16–20  (FOMC / ES Expiry)",
+    "Week 4  Mar 23–26",
+    "Week 5  Mar 30–31  (Month-end)",
+]
+WEEK_SLICES = [
+    slice(0,  5),
+    slice(5,  10),
+    slice(10, 15),
+    slice(15, 19),
+    slice(19, 21),
 ]
 
 # ─────────────────────────────────────────────────────────────
-# Price generation helpers
+# Price generation
 # ─────────────────────────────────────────────────────────────
 
-def _tick(price: float) -> float:
-    return round(round(price / ES_TICK) * ES_TICK, 2)
+def _tick(p: float) -> float:
+    return round(round(p / ES_TICK) * ES_TICK, 2)
 
 
-def generate_minute_prices(
-    open_price: float,
-    daily_drift: float,
-    volatility: float,
-    n_minutes: int,
-    seed: int,
-) -> List[float]:
-    """
-    Geometric Brownian Motion walk with intraday structure:
-      - Opening gap + expansion (first 30 min)
-      - Lunch slow-down (min 120-180)
-      - Afternoon trend continuation (min 180+)
-    """
+def generate_minute_prices(open_price, daily_drift, volatility, n_minutes, seed):
     rng = random.Random(seed)
     prices = [open_price]
     drift_per_min = daily_drift / n_minutes
-
     for i in range(1, n_minutes):
         prev = prices[-1]
-        # Intraday volatility scaling
-        if i < 30:
-            vol_scale = 1.6       # high vol at open
-        elif 120 <= i < 180:
-            vol_scale = 0.5       # lunch lull
-        else:
-            vol_scale = 1.0
-
+        if i < 30:          vol_scale = 1.6
+        elif 120 <= i < 180: vol_scale = 0.5
+        else:                vol_scale = 1.0
         noise = rng.gauss(0, volatility * vol_scale)
-        new_price = _tick(prev + drift_per_min + noise)
-        prices.append(max(new_price, 1.0))
-
+        prices.append(max(_tick(prev + drift_per_min + noise), 1.0))
     return prices
 
 
 # ─────────────────────────────────────────────────────────────
-# Signal and trade data
+# Signal generation
 # ─────────────────────────────────────────────────────────────
 
 @dataclass
 class Signal:
-    minute:        int
-    action:        str    # BUY / SELL
-    imbalance:     float
-    delta:         int
-    streak:        int
+    minute: int; action: str; imbalance: float; delta: int; streak: int
 
 
-@dataclass
-class TradeRecord:
-    entry_time:   str
-    exit_time:    str
-    action:       str
-    symbol:       str
-    entry_price:  float
-    sl_price:     float
-    tp_price:     float
-    exit_price:   float
-    outcome:      str    # TP_HIT / SL_HIT / EOD_FLAT
-    pnl:          float
-    duration_min: int
-    imbalance:    float
-    delta:        int
-
-
-# ─────────────────────────────────────────────────────────────
-# Signal generator
-# ─────────────────────────────────────────────────────────────
-
-def generate_signals(
-    prices: List[float],
-    win_rate: float,
-    regime: str,
-    seed: int,
-) -> List[Signal]:
-    """
-    Simulate DOM imbalance + delta signals along the price path.
-
-    Rather than deriving imbalance from tick-level DOM (not available here),
-    we generate signals directly from momentum windows and statistical
-    probability calibrated to realistic order-flow conditions:
-      - Trending day  : 7–11 signals in session
-      - Choppy day    : 4–7 signals
-      - Volatile day  : 3–6 signals (many filtered out by spread / delta check)
-    Each signal is placed at a minute index that aligns with a momentum move
-    in the price path so the prices shown look realistic.
-    """
+def generate_signals(prices, win_rate, regime, seed):
     rng = random.Random(seed + 1000)
+    if "Trending" in regime:   n_signals = rng.randint(10, 14)
+    elif "Volatile" in regime: n_signals = rng.randint(7,  10)
+    else:                      n_signals = rng.randint(8,  12)
 
-    # Signals per day — more generous counts so trades spread across the session
-    if "Trending" in regime:
-        n_signals = rng.randint(10, 14)
-    elif "Volatile" in regime:
-        n_signals = rng.randint(7, 10)
-    else:
-        n_signals = rng.randint(8, 12)
-
-    # Usable minute window (skip first 10 min and last 15 min of RTH)
-    # RTH = ~405 min total → usable ≈ 380 minutes
     usable = list(range(10, len(prices) - 15))
     if len(usable) < n_signals * 2:
         return []
 
-    # Spread signals across the day with a minimum 20-min gap between them.
-    # Iterate through the *shuffled* pool so they land at random times, not
-    # all bunched at the open.  (Previous bug: sorted(pool) undid the shuffle.)
-    min_gap = 20   # minutes — realistic between qualifying DOM setups
-    candidates: List[int] = []
+    min_gap = 20
+    candidates = []
     pool = usable[:]
     rng.shuffle(pool)
-    for minute in pool:          # ← shuffled order, NOT sorted
+    for minute in pool:
         if all(abs(minute - c) >= min_gap for c in candidates):
             candidates.append(minute)
         if len(candidates) >= n_signals:
             break
-    candidates.sort()            # sort only for chronological log output
+    candidates.sort()
 
-    signals: List[Signal] = []
+    signals = []
     for i in candidates:
-        # Direction: follow the local price momentum over the last 15 min
         look = min(15, i)
         move = prices[i] - prices[i - look]
-
         if "Trending ↑" in regime:
-            # Bias long on up-trending days
-            action = "BUY" if rng.random() < 0.70 else "SELL"
+            action = "BUY"  if rng.random() < 0.70 else "SELL"
         elif "Trending ↓" in regime:
             action = "SELL" if rng.random() < 0.70 else "BUY"
         else:
-            # Choppy/volatile — follow local momentum
             action = "BUY" if move >= 0 else "SELL"
-            if rng.random() < 0.25:          # 25% counter-trend noise
+            if rng.random() < 0.25:
                 action = "SELL" if action == "BUY" else "BUY"
-
-        # Realistic imbalance and delta values for a qualifying signal
         imbalance = round(rng.uniform(4.1, 7.5), 1)
         delta_mag  = rng.randint(78, 185)
         delta      = delta_mag if action == "BUY" else -delta_mag
         streak     = rng.randint(3, 6)
-
         signals.append(Signal(i, action, imbalance, delta, streak))
-
     return signals
 
 
@@ -223,96 +176,58 @@ def generate_signals(
 # Trade executor
 # ─────────────────────────────────────────────────────────────
 
-def execute_trades(
-    date_str: str,
-    prices: List[float],
-    signals: List[Signal],
-    win_rate: float,
-    day_seed: int,
-) -> Tuple[List[TradeRecord], float]:
-    """
-    Walk through signals, check risk guards, and resolve each trade.
-    Returns (trades, day_pnl).
-    """
+@dataclass
+class TradeRecord:
+    entry_time: str; exit_time: str; action: str; symbol: str
+    entry_price: float; sl_price: float; tp_price: float; exit_price: float
+    outcome: str; pnl: float; duration_min: int; imbalance: float; delta: int
+
+
+def execute_trades(date_str, contract, prices, signals, win_rate, day_seed):
     rng = random.Random(day_seed + 9999)
-    trades: List[TradeRecord] = []
-    day_pnl = 0.0
-    last_entry_min = -999
+    trades, day_pnl, last_entry_min = [], 0.0, -999
 
     for sig in signals:
         i = sig.minute
+        if i - last_entry_min < (COOLDOWN_SECONDS // 60): continue
+        if day_pnl <= -DAILY_LOSS_LIMIT: break
+        if day_pnl >= DAILY_PROFIT_CAP:  break
+        if RTH_OPEN_MIN + i > RTH_CLOSE_MIN: break
 
-        # ---- cooldown ---
-        if i - last_entry_min < (COOLDOWN_SECONDS // 60):
-            continue
-
-        # ---- risk guards ---
-        if day_pnl <= -DAILY_LOSS_LIMIT:
-            break
-        if day_pnl >= DAILY_PROFIT_CAP:
-            break
-
-        # ---- EOD guard ---
-        abs_minute = RTH_OPEN_MIN + i
-        if abs_minute > RTH_CLOSE_MIN:
-            break
-
-        # ---- prices ---
-        spread = ES_TICK
         if sig.action == "BUY":
-            entry = _tick(prices[i] + spread / 2)
+            entry = _tick(prices[i] + ES_TICK / 2)
             sl    = _tick(entry - SL_POINTS)
             tp    = _tick(entry + TP_POINTS)
         else:
-            entry = _tick(prices[i] - spread / 2)
+            entry = _tick(prices[i] - ES_TICK / 2)
             sl    = _tick(entry + SL_POINTS)
             tp    = _tick(entry - TP_POINTS)
 
-        # ---- simulate outcome ---
         won = rng.random() < win_rate
-
-        # Find approximate exit minute (TP/SL usually hit within 1-20 min)
         if won:
-            exit_minutes = rng.randint(3, 18)
-            exit_price   = tp
-            outcome      = "TP_HIT"
-            pnl          = TP_DOLLARS
+            exit_minutes, exit_price, outcome, pnl = (
+                rng.randint(3, 18), tp, "TP_HIT", TP_DOLLARS)
         else:
-            exit_minutes = rng.randint(2, 12)
-            exit_price   = sl
-            outcome      = "SL_HIT"
-            pnl          = -SL_DOLLARS
+            exit_minutes, exit_price, outcome, pnl = (
+                rng.randint(2, 12), sl, "SL_HIT", -SL_DOLLARS)
 
-        # Check EOD forced close
-        exit_min_abs = abs_minute + exit_minutes
-        if exit_min_abs > RTH_OPEN_MIN + len(prices) - 1:
-            exit_min_abs = RTH_OPEN_MIN + len(prices) - 1
-            exit_price   = _tick(prices[min(i + exit_minutes, len(prices) - 1)])
-            outcome      = "EOD_FLAT"
-            pnl          = round((exit_price - entry) * ES_POINT_VALUE *
-                                  (1 if sig.action == "BUY" else -1), 2)
+        if RTH_OPEN_MIN + i + exit_minutes > RTH_OPEN_MIN + len(prices) - 1:
+            exit_price = _tick(prices[min(i + exit_minutes, len(prices) - 1)])
+            outcome    = "EOD_FLAT"
+            pnl        = round((exit_price - entry) * ES_POINT_VALUE *
+                               (1 if sig.action == "BUY" else -1), 2)
 
-        # ---- build timestamps ---
-        base_dt = datetime(2026, int(date_str[5:7]), int(date_str[8:]))
+        base_dt  = datetime(int(date_str[:4]), int(date_str[5:7]), int(date_str[8:]))
         entry_dt = base_dt.replace(hour=8, minute=30) + timedelta(minutes=i)
         exit_dt  = base_dt.replace(hour=8, minute=30) + timedelta(minutes=i + exit_minutes)
 
         trades.append(TradeRecord(
-            entry_time   = entry_dt.strftime("%H:%M:%S"),
-            exit_time    = exit_dt.strftime("%H:%M:%S"),
-            action       = sig.action,
-            symbol       = CONTRACT,
-            entry_price  = entry,
-            sl_price     = sl,
-            tp_price     = tp,
-            exit_price   = exit_price,
-            outcome      = outcome,
-            pnl          = pnl,
-            duration_min = exit_minutes,
-            imbalance    = sig.imbalance,
-            delta        = sig.delta,
+            entry_time=entry_dt.strftime("%H:%M:%S"), exit_time=exit_dt.strftime("%H:%M:%S"),
+            action=sig.action, symbol=contract,
+            entry_price=entry, sl_price=sl, tp_price=tp, exit_price=exit_price,
+            outcome=outcome, pnl=pnl, duration_min=exit_minutes,
+            imbalance=sig.imbalance, delta=sig.delta,
         ))
-
         day_pnl += pnl
         last_entry_min = i
 
@@ -320,212 +235,240 @@ def execute_trades(
 
 
 # ─────────────────────────────────────────────────────────────
-# Formatting helpers (mimic bot log style)
+# Colours & log helpers
 # ─────────────────────────────────────────────────────────────
 
-GREEN  = "\033[92m"
-RED    = "\033[91m"
-YELLOW = "\033[93m"
-CYAN   = "\033[96m"
-BOLD   = "\033[1m"
-RESET  = "\033[0m"
-DIM    = "\033[2m"
+G = "\033[92m"; R = "\033[91m"; Y = "\033[93m"
+C = "\033[96m"; B = "\033[1m";  D = "\033[2m"; X = "\033[0m"
 
-def _col(text, code): return f"{code}{text}{RESET}"
-def _ts(date_str, time_str): return f"{date_str} {time_str}"
+def _c(t, code): return f"{code}{t}{X}"
+def _ts(d, t):   return f"{d} {t}"
 
+def log(ts, level, msg, col=""):
+    lc = {"INFO   ":C,"SUCCESS":G,"WARNING":Y,"ERROR  ":R}.get(level,"")
+    print(f"{D}{ts}{X} | {lc}{level}{X} | {col}{msg}{X}")
 
-def log(ts, level, msg, color=None):
-    lvl_colors = {
-        "INFO   ": CYAN,
-        "SUCCESS": GREEN,
-        "WARNING": YELLOW,
-        "ERROR  ": RED,
-    }
-    c = lvl_colors.get(level, "")
-    print(f"{DIM}{ts}{RESET} | {c}{level}{RESET} | {color or ''}{msg}{RESET}")
-
-
-def print_trade_entry(date_str, t: TradeRecord):
-    direction = "↑" if t.action == "BUY" else "↓"
-    log(_ts(date_str, t.entry_time), "INFO   ",
-        f"ORDER FLOW ENTRY: {t.action} 1 {t.symbol} {direction}  "
+def print_entry(d, t):
+    arrow = "↑" if t.action == "BUY" else "↓"
+    log(_ts(d, t.entry_time), "INFO   ",
+        f"ORDER FLOW ENTRY: {t.action} 1 {t.symbol} {arrow}  "
         f"[imbalance {t.imbalance:.1f}:1 | delta {t.delta:+d} | streak 3]  "
         f"ref={t.entry_price:.2f}  SL={t.sl_price:.2f} (−${SL_DOLLARS:.0f})  "
         f"TP={t.tp_price:.2f} (+${TP_DOLLARS:.0f})")
-    log(_ts(date_str, t.entry_time), "SUCCESS",
+    log(_ts(d, t.entry_time), "SUCCESS",
         f"OSO entry confirmed: {t.action} 1 {t.symbol}  "
         f"SL={t.sl_price:.2f}  TP={t.tp_price:.2f}")
 
-
-def print_trade_exit(date_str, t: TradeRecord):
-    if t.outcome == "TP_HIT":
-        outcome_str = f"{GREEN}TP HIT  +${t.pnl:,.0f}{RESET}"
-    elif t.outcome == "SL_HIT":
-        outcome_str = f"{RED}SL HIT  −${abs(t.pnl):,.0f}{RESET}"
+def print_exit(d, t):
+    if   t.outcome == "TP_HIT":  o = f"{G}TP HIT   +${t.pnl:,.0f}{X}"
+    elif t.outcome == "SL_HIT":  o = f"{R}SL HIT   −${abs(t.pnl):,.0f}{X}"
     else:
-        pnl_str = f"+${t.pnl:,.0f}" if t.pnl >= 0 else f"−${abs(t.pnl):,.0f}"
-        outcome_str = f"{YELLOW}EOD FLAT  {pnl_str}{RESET}"
-
-    log(_ts(date_str, t.exit_time), "INFO   ",
-        f"Trade closed: {t.action} {t.symbol} exit={t.exit_price:.2f}  "
-        f"({t.duration_min}m)  {outcome_str}")
+        s = f"+${t.pnl:,.0f}" if t.pnl >= 0 else f"−${abs(t.pnl):,.0f}"
+        o = f"{Y}EOD FLAT  {s}{X}"
+    log(_ts(d, t.exit_time), "INFO   ",
+        f"Trade closed: {t.action} {t.symbol}  exit={t.exit_price:.2f}  "
+        f"({t.duration_min}m)  {o}")
 
 
 # ─────────────────────────────────────────────────────────────
-# Main simulation loop
+# Weekly summary printer
+# ─────────────────────────────────────────────────────────────
+
+def print_week_summary(label, week_day_pnls, week_trades, balance, cum_pnl, max_dd):
+    W = 95
+    total  = len(week_trades)
+    wins   = sum(1 for t in week_trades if t.outcome == "TP_HIT")
+    losses = sum(1 for t in week_trades if t.outcome == "SL_HIT")
+    eod    = total - wins - losses
+    wr     = wins / total * 100 if total else 0
+    net    = sum(week_day_pnls)
+    col    = G if net >= 0 else R
+    pnl_by_day = "  ".join(
+        _c(f"${p:>+,.0f}", G if p >= 0 else R) for p in week_day_pnls)
+    print()
+    print(_c(f"  ┌─ {label} ─ Net: ${net:>+,.0f}  │  "
+             f"{total} trades  W:{wins} L:{losses} E:{eod}  WR:{wr:.0f}%  │  "
+             f"Balance: ${balance:,.0f}  │  {pnl_by_day}", col))
+
+
+# ─────────────────────────────────────────────────────────────
+# Main
 # ─────────────────────────────────────────────────────────────
 
 def run(seed_base: int = 42):
-    random.seed(seed_base)
-    balance    = STARTING_BALANCE
-    peak_eq    = STARTING_BALANCE
-    cum_pnl    = 0.0
-    max_dd     = 0.0
-    all_trades: List[TradeRecord] = []
-    day_pnls: List[float] = []
-
+    balance = STARTING_BALANCE
+    peak_eq = STARTING_BALANCE
+    cum_pnl = 0.0
+    max_dd  = 0.0
     open_price = BASE_PRICE
+    locked_out = False
 
-    WIDTH = 95
+    all_trades:  List[TradeRecord] = []
+    all_day_pnls: List[float] = []
+
+    W = 95
     print()
-    print("=" * WIDTH)
-    print(f"  TraderJP  |  ES Order-Flow Scalper  |  {CONTRACT}  |  Feb 02–06 2026  |  PA-50k Apex")
-    print(f"  Strategy: DOM imbalance ≥ 4:1  +  delta ≥ 75  +  3-streak  |  SL=$300  TP=$600  |  RTH only")
-    print("=" * WIDTH)
+    print("=" * W)
+    print(f"  TraderJP  |  ES Order-Flow Scalper  |  March 2026 (All 21 Days)  |  PA-50k Apex")
+    print(f"  ESH6 → ESM6 rollover Mar 13  |  FOMC Mar 18  |  ES expiry Mar 20")
+    print(f"  Strategy: DOM imbalance ≥ 4:1  +  delta ≥ 75  +  3-streak  |  SL=$300  TP=$600")
+    print("=" * W)
 
-    for day_idx, day in enumerate(DAYS):
-        seed = seed_base + day_idx * 137
-        n_min = RTH_CLOSE_MIN - RTH_OPEN_MIN + 30   # ~400 minutes
+    for week_idx, (wlabel, wslice) in enumerate(zip(WEEK_LABELS, WEEK_SLICES)):
+        week_days   = DAYS[wslice]
+        week_trades: List[TradeRecord] = []
+        week_pnls:   List[float] = []
 
-        # Generate price path
-        prices = generate_minute_prices(
-            open_price  = open_price,
-            daily_drift = day.daily_drift,
-            volatility  = day.volatility,
-            n_minutes   = n_min,
-            seed        = seed,
-        )
-
-        # Generate signals
-        signals = generate_signals(prices, day.win_rate, day.regime, seed)
-
-        # Execute trades with risk guards
-        trades, day_pnl = execute_trades(
-            day.date_str, prices, signals, day.win_rate, seed
-        )
-
-        # ── Day header ──────────────────────────────────────────
         print()
-        close_price = _tick(prices[-1])
-        chg = close_price - open_price
-        chg_str = f"{'+' if chg >= 0 else ''}{chg:.2f}"
-        print(_col(f"  ── {day.label}  │  {day.regime}  │  "
-                   f"Open {open_price:.2f}  Close {close_price:.2f}  ({chg_str} pts)  ──", BOLD))
-        print()
+        print(_c(f"  {'━'*W}", D))
+        print(_c(f"  {wlabel}", B))
+        print(_c(f"  {'━'*W}", D))
 
-        # ── Trade log ────────────────────────────────────────────
-        if not trades:
-            log(day.date_str + " 08:30:00", "INFO   ",
-                "Session open — monitoring order flow. No qualifying signals today.")
-        else:
-            for t in trades:
-                print_trade_entry(day.date_str, t)
-                print_trade_exit(day.date_str, t)
-                print()
+        for day_idx_global, day in enumerate(week_days):
+            day_idx = wslice.start + day_idx_global
+            seed    = seed_base + day_idx * 137
+            n_min   = RTH_CLOSE_MIN - RTH_OPEN_MIN + 30
 
-        # ── Risk events ──────────────────────────────────────────
-        if day_pnl <= -DAILY_LOSS_LIMIT:
-            log(day.date_str + " --:--:--", "ERROR  ",
-                f"DAILY LOSS LIMIT HIT: −${DAILY_LOSS_LIMIT:.0f}. "
-                f"Flattening all positions. Bot locked for the day.", RED)
-            day_pnl = -DAILY_LOSS_LIMIT
-        elif day_pnl >= DAILY_PROFIT_CAP:
-            log(day.date_str + " --:--:--", "WARNING",
-                f"Daily profit cap ${DAILY_PROFIT_CAP:.0f} reached. "
-                f"No new entries for remainder of session.", YELLOW)
-            day_pnl = DAILY_PROFIT_CAP
+            prices  = generate_minute_prices(open_price, day.daily_drift,
+                                             day.volatility, n_min, seed)
+            signals = generate_signals(prices, day.win_rate, day.regime, seed)
+            trades, day_pnl = execute_trades(
+                day.date_str, day.contract, prices, signals, day.win_rate, seed)
 
-        # ── EOD flatten ──────────────────────────────────────────
-        log(day.date_str + " 15:10:00", "WARNING",
-            f"EOD flatten: 5 min before RTH close. Flattening all positions.")
+            close_price = _tick(prices[-1])
+            chg = close_price - open_price
+            note_str = f"  [{day.note}]" if day.note else ""
+            print()
+            print(_c(
+                f"  ── {day.label}  │  {day.regime}  │  "
+                f"{day.contract}  │  Open {open_price:.2f}  "
+                f"Close {close_price:.2f}  ({chg:+.2f} pts){note_str}  ──", B))
+            print()
 
-        # ── Day settlement ───────────────────────────────────────
-        balance  += day_pnl
-        cum_pnl   = balance - STARTING_BALANCE
-        if balance > peak_eq:
-            peak_eq = balance
-        dd = peak_eq - balance
-        if dd > max_dd:
-            max_dd = dd
+            if locked_out:
+                log(day.date_str + " 08:30:00", "ERROR  ",
+                    "Account locked — trailing drawdown limit reached. No trading today.", R)
+            elif not trades:
+                log(day.date_str + " 08:30:00", "INFO   ",
+                    "Session open — monitoring order flow. No qualifying signals today.")
+            else:
+                for t in trades:
+                    print_entry(day.date_str, t)
+                    print_exit(day.date_str, t)
+                    print()
 
-        wins   = sum(1 for t in trades if t.outcome == "TP_HIT")
-        losses = sum(1 for t in trades if t.outcome == "SL_HIT")
-        eod    = sum(1 for t in trades if t.outcome == "EOD_FLAT")
-        n      = len(trades)
-        wr     = (wins / n * 100) if n else 0
+            # Risk events
+            if not locked_out:
+                if day_pnl <= -DAILY_LOSS_LIMIT:
+                    log(day.date_str + " --:--:--", "ERROR  ",
+                        f"DAILY LOSS LIMIT HIT: −${DAILY_LOSS_LIMIT:.0f}. "
+                        f"Bot locked for the day.", R)
+                    day_pnl = -DAILY_LOSS_LIMIT
+                elif day_pnl >= DAILY_PROFIT_CAP:
+                    log(day.date_str + " --:--:--", "WARNING",
+                        f"Daily profit cap ${DAILY_PROFIT_CAP:.0f} reached. "
+                        f"No new entries for remainder of session.", Y)
+                    day_pnl = DAILY_PROFIT_CAP
 
-        pnl_color = GREEN if day_pnl >= 0 else RED
-        print()
-        print(_col(f"  {'─'*89}", DIM))
-        pnl_display = f"${day_pnl:>+8,.0f}"
-        cum_display = f"${cum_pnl:>+8,.0f}"
-        bal_display = f"${balance:>10,.0f}"
-        print(
-            _col(
-                f"  Day P&L: {pnl_display}   Cum P&L: {cum_display}   "
-                f"Balance: {bal_display}   "
-                f"Trades: {n}  W:{wins} L:{losses} E:{eod}  "
-                f"WR: {wr:.0f}%",
-                pnl_color if day_pnl != 0 else DIM,
-            )
-        )
-        print(_col(f"  {'─'*89}", DIM))
+            log(day.date_str + " 15:10:00", "WARNING",
+                "EOD flatten: 5 min before RTH close. All positions flat.")
 
-        all_trades.extend(trades)
-        day_pnls.append(day_pnl)
-        open_price = close_price   # next day opens at today's close
+            # Settlement
+            if not locked_out:
+                balance  += day_pnl
+            cum_pnl = balance - STARTING_BALANCE
+            if balance > peak_eq:
+                peak_eq = balance
+            dd = peak_eq - balance
+            if dd > max_dd:
+                max_dd = dd
 
-    # ── Weekly summary ───────────────────────────────────────────
+            # Check trailing DD lockout
+            if dd >= MAX_TRAILING_DD and not locked_out:
+                locked_out = True
+                log(day.date_str + " --:--:--", "ERROR  ",
+                    f"MAX TRAILING DRAWDOWN HIT: −${dd:,.0f}. "
+                    f"Account permanently locked. No further trading.", R)
+
+            wins_d   = sum(1 for t in trades if t.outcome == "TP_HIT")
+            losses_d = sum(1 for t in trades if t.outcome == "SL_HIT")
+            eod_d    = len(trades) - wins_d - losses_d
+            wr_d     = wins_d / len(trades) * 100 if trades else 0
+            col_d    = G if day_pnl >= 0 else R
+
+            print()
+            print(_c("  " + "─" * 89, D))
+            print(_c(
+                f"  Day P&L: ${day_pnl:>+8,.0f}   Cum P&L: ${cum_pnl:>+8,.0f}   "
+                f"Balance: ${balance:>10,.0f}   "
+                f"Trades: {len(trades)}  W:{wins_d} L:{losses_d} E:{eod_d}  WR:{wr_d:.0f}%",
+                col_d))
+            print(_c("  " + "─" * 89, D))
+
+            all_trades.extend(trades)
+            week_trades.extend(trades)
+            all_day_pnls.append(day_pnl)
+            week_pnls.append(day_pnl)
+            open_price = close_price
+
+        print_week_summary(wlabel, week_pnls, week_trades, balance, cum_pnl, max_dd)
+
+    # ── Monthly summary ───────────────────────────────────────────────
     total   = len(all_trades)
     wins    = sum(1 for t in all_trades if t.outcome == "TP_HIT")
     losses  = sum(1 for t in all_trades if t.outcome == "SL_HIT")
-    eod_cls = sum(1 for t in all_trades if t.outcome == "EOD_FLAT")
-    wr      = (wins / total * 100) if total else 0
-    gp      = wins * TP_DOLLARS
+    eod_cls = total - wins - losses
+    wr      = wins / total * 100 if total else 0
+    gp      = wins   * TP_DOLLARS
     gl      = losses * SL_DOLLARS
-    pf      = (gp / gl) if gl else float("inf")
+    pf      = gp / gl if gl else float("inf")
 
     print()
-    print("=" * WIDTH)
-    print(_col("  WEEKLY SUMMARY — Feb 02–06 2026", BOLD))
-    print("=" * WIDTH)
-    print(f"  {'Total trades':<28} {total}")
-    print(f"  {'Wins (TP hit)':<28} {wins}")
-    print(f"  {'Losses (SL hit)':<28} {losses}")
-    print(f"  {'EOD flats':<28} {eod_cls}")
-    print(f"  {'Win rate':<28} {wr:.1f}%")
-    print(f"  {'Gross profit':<28} ${gp:,.0f}")
-    print(f"  {'Gross loss':<28} ${gl:,.0f}")
-    print(f"  {'Profit factor':<28} {pf:.2f}")
-    print(f"  {'Net P&L':<28} ${cum_pnl:>+,.2f}")
-    print(f"  {'Final balance':<28} ${balance:,.2f}")
-    print(f"  {'Peak equity':<28} ${peak_eq:,.2f}")
-    print(f"  {'Max intra-week drawdown':<28} ${max_dd:,.2f}")
+    print("=" * W)
+    print(_c("  MARCH 2026 — MONTHLY SUMMARY", B))
+    print("=" * W)
+    rows = [
+        ("Trading days",        "21"),
+        ("Total trades",        str(total)),
+        ("Wins (TP hit)",       f"{wins}"),
+        ("Losses (SL hit)",     f"{losses}"),
+        ("EOD flats",           f"{eod_cls}"),
+        ("Win rate",            f"{wr:.1f}%"),
+        ("Gross profit",        f"${gp:,.0f}"),
+        ("Gross loss",          f"${gl:,.0f}"),
+        ("Profit factor",       f"{pf:.2f}"),
+        ("Net P&L",             f"${cum_pnl:>+,.2f}"),
+        ("Final balance",       f"${balance:,.2f}"),
+        ("Peak equity",         f"${peak_eq:,.2f}"),
+        ("Max drawdown",        f"${max_dd:,.2f}"),
+        ("Account locked",      "YES — trailing DD" if locked_out else "No"),
+    ]
+    for k, v in rows:
+        print(f"  {k:<28} {v}")
 
-    daily_pnl_str = "  ".join(
-        (_col(f"${p:>+,.0f}", GREEN if p >= 0 else RED)) for p in day_pnls
-    )
-    print(f"  {'Day-by-day P&L':<28} {daily_pnl_str}")
-
-    # Apex progress
-    pct = cum_pnl / 3_000 * 100 if cum_pnl > 0 else 0
-    bar_filled = int(pct / 5)
-    bar = "█" * bar_filled + "░" * (20 - bar_filled)
-    print(f"\n  Apex profit target progress  [{bar}]  "
-          f"${cum_pnl:>+,.0f} / $3,000  ({pct:.1f}%)")
+    # Day-by-day P&L strip
     print()
-    print("=" * WIDTH)
+    print("  Day-by-day P&L:")
+    for i, (day, pnl) in enumerate(zip(DAYS, all_day_pnls)):
+        if i in (0, 5, 10, 15, 19):
+            wk = ["Wk1","Wk2","Wk3","Wk4","Wk5"][{0:0,5:1,10:2,15:3,19:4}[i]]
+            print(f"\n  {wk}  ", end="")
+        col_p = G if pnl >= 0 else R
+        print(_c(f"{day.label[-6:]} ${pnl:>+,.0f}", col_p), end="   ")
+    print()
+
+    # Apex progress bar
+    pct       = max(0, cum_pnl / 3_000 * 100)
+    bar_n     = int(min(pct / 5, 20))
+    bar       = "█" * bar_n + "░" * (20 - bar_n)
+    status    = "✓ PASS" if cum_pnl >= 3_000 else ("✗ LOCKED" if locked_out else "⏳ IN PROGRESS")
+    col_status = G if cum_pnl >= 3_000 else (R if locked_out else Y)
+    print()
+    print(f"  Apex $3k profit target  [{bar}]  "
+          f"${cum_pnl:>+,.0f} / $3,000  ({pct:.1f}%)  "
+          + _c(status, col_status))
+    print()
+    print("=" * W)
     print()
 
 
