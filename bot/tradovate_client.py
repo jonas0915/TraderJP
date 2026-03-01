@@ -1,12 +1,17 @@
 """
 Tradovate REST API client.
 Handles authentication, token refresh, and all API calls for trading and account data.
+
+Uses a persistent ``requests.Session`` for connection pooling and automatic
+retry with exponential backoff on transient (5xx / network) errors.
 """
 
 import time
 import uuid
 import threading
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from loguru import logger
 
 
@@ -14,10 +19,45 @@ class TradovateError(Exception):
     """Raised when the Tradovate API returns an error."""
 
 
+def _build_session() -> requests.Session:
+    """Create a requests session with connection pooling and retry logic.
+
+    Retries up to 3 times on 500/502/503/504 and connection errors with
+    exponential backoff (0.5s, 1s, 2s).  Order-placement endpoints are
+    excluded from POST retries because replaying a market order could
+    cause double fills — only safe POST endpoints are retried via the
+    ``allowed_methods`` list.
+    """
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=4,
+        pool_maxsize=8,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 class TradovateClient:
     LIVE_BASE = "https://live.tradovateapi.com/v1"
     DEMO_BASE = "https://demo.tradovateapi.com/v1"
     MD_BASE   = "https://md.tradovateapi.com/v1"
+
+    # Endpoints where an automatic POST retry could cause double execution.
+    # For these we do NOT retry — we let the caller handle the failure.
+    _NO_RETRY_ENDPOINTS = frozenset({
+        "order/placeorder",
+        "order/placeOSO",
+        "order/cancelorder",
+    })
 
     def __init__(
         self,
@@ -44,6 +84,12 @@ class TradovateClient:
         self._token_expiry   : float = 0.0
         self._lock = threading.Lock()
 
+        # Persistent HTTP session with connection pooling + retry
+        self._session: requests.Session = _build_session()
+
+        # A separate no-retry session for order placement endpoints
+        self._session_no_retry: requests.Session = requests.Session()
+
         # Populated after auth
         self.account_id   : int = 0
         self.account_spec : str = ""
@@ -64,7 +110,7 @@ class TradovateClient:
             "appId":      "TraderJP",
             "appVersion": "1.0.0",
         }
-        resp = requests.post(url, json=payload, timeout=15)
+        resp = self._session.post(url, json=payload, timeout=15)
         self._check_response(resp, "authenticate")
         data = resp.json()
 
@@ -129,15 +175,21 @@ class TradovateClient:
 
     def _get(self, endpoint: str, params: dict = None, md: bool = False) -> dict | list:
         base = self.MD_BASE if md else self.base_url
-        resp = requests.get(f"{base}/{endpoint}", params=params,
-                            headers=self._headers(md=md), timeout=15)
+        resp = self._session.get(f"{base}/{endpoint}", params=params,
+                                 headers=self._headers(md=md), timeout=15)
         self._check_response(resp, endpoint)
         return resp.json()
 
     def _post(self, endpoint: str, body: dict = None, md: bool = False) -> dict | list:
         base = self.MD_BASE if md else self.base_url
-        resp = requests.post(f"{base}/{endpoint}", json=body or {},
-                             headers=self._headers(md=md), timeout=15)
+        # Use the no-retry session for order placement to avoid double fills
+        session = (
+            self._session_no_retry
+            if endpoint in self._NO_RETRY_ENDPOINTS
+            else self._session
+        )
+        resp = session.post(f"{base}/{endpoint}", json=body or {},
+                            headers=self._headers(md=md), timeout=15)
         self._check_response(resp, endpoint)
         return resp.json()
 
@@ -152,7 +204,7 @@ class TradovateClient:
         # authenticate() sets it moments before calling _load_account().
         if not self.access_token:
             raise TradovateError("get_accounts: not authenticated yet.")
-        resp = requests.get(
+        resp = self._session.get(
             f"{self.base_url}/account/list",
             headers={
                 "Authorization": f"Bearer {self.access_token}",
@@ -348,10 +400,28 @@ class TradovateClient:
         return result
 
     def flatten_all(self):
-        """Cancel all orders then liquidate all positions."""
+        """Cancel all orders then liquidate all positions.
+
+        Retries the liquidation up to 3 times with backoff because this is the
+        single most critical safety operation — a failure here leaves the
+        account exposed.
+        """
         logger.warning("FLATTEN ALL — cancelling orders then liquidating positions.")
         self.cancel_all_orders()
-        self.liquidate_position()
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                self.liquidate_position()
+                return
+            except TradovateError as e:
+                last_err = e
+                delay = 0.5 * (2 ** (attempt - 1))
+                logger.error(
+                    f"Flatten liquidation attempt {attempt}/3 failed: {e}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                time.sleep(delay)
+        raise TradovateError(f"FLATTEN FAILED after 3 attempts: {last_err}")
 
     # ------------------------------------------------------------------
     # Contract / Quote

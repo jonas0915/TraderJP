@@ -307,7 +307,17 @@ class OrderFlowStrategy:
             )
             await asyncio.to_thread(self.client.cancel_all_orders)
             await asyncio.to_thread(self.client.liquidate_position, symbol)
-            await asyncio.sleep(0.5)
+
+            # Wait until the position is actually flat before entering the
+            # new direction.  Without this check, a slow liquidation fill
+            # could leave us doubled-up.
+            flat = await self._wait_for_flat(symbol, timeout_seconds=5.0)
+            if not flat:
+                logger.error(
+                    f"OrderFlow: position still not flat after liquidation "
+                    f"of {symbol}. Aborting entry."
+                )
+                return
 
         # ---- compute bracket prices before sending entry ------------
         #  Use last-known best ask for longs (lifted ask = expected fill)
@@ -430,3 +440,15 @@ class OrderFlowStrategy:
             if pos.get("symbol", "") == symbol:
                 return pos.get("netPos", 0)
         return 0
+
+    async def _wait_for_flat(self, symbol: str, timeout_seconds: float = 5.0) -> bool:
+        """Poll position until flat or timeout. Returns True if flat."""
+        poll_interval = 0.5
+        elapsed = 0.0
+        while elapsed < timeout_seconds:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+            pos = await self._get_position(symbol)
+            if pos == 0:
+                return True
+        return False

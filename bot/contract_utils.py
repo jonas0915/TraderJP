@@ -18,7 +18,7 @@ _QUARTERS = [
     (12, "Z"),   # December
 ]
 
-ROLL_DAYS_BEFORE_EXPIRY = 5  # Roll to next contract N trading days before expiry
+ROLL_TRADING_DAYS_BEFORE_EXPIRY = 5  # Roll to next contract N *trading* days before expiry
 
 
 def _third_friday(year: int, month: int) -> date:
@@ -36,12 +36,28 @@ def _expiry_date(year: int, month: int) -> date:
     return _third_friday(year, month)
 
 
+def _subtract_trading_days(from_date: date, trading_days: int) -> date:
+    """Subtract N *trading* days (Mon-Fri) from a date.
+
+    This does not account for market holidays, but CME holidays are rare
+    enough (6-7/year) that being off by 1 day is acceptable — rolling a
+    day early is always safe, rolling a day late is the real risk.
+    """
+    current = from_date
+    remaining = trading_days
+    while remaining > 0:
+        current -= timedelta(days=1)
+        if current.weekday() < 5:  # Monday-Friday
+            remaining -= 1
+    return current
+
+
 def get_front_month_symbol(base: str = "ES", as_of: date = None) -> str:
     """
     Return the front-month ES contract symbol (e.g. 'ESH5', 'ESM5').
 
-    We roll ROLL_DAYS_BEFORE_EXPIRY calendar days before the expiry date
-    so we don't get caught holding into expiration.
+    We roll ROLL_TRADING_DAYS_BEFORE_EXPIRY *trading* days before the
+    expiry date so we don't get caught holding into expiration.
     """
     today = as_of or date.today()
     year  = today.year
@@ -51,7 +67,7 @@ def get_front_month_symbol(base: str = "ES", as_of: date = None) -> str:
     for y in (year, year + 1):
         for month, code in _QUARTERS:
             exp = _expiry_date(y, month)
-            roll_date = exp - timedelta(days=ROLL_DAYS_BEFORE_EXPIRY)
+            roll_date = _subtract_trading_days(exp, ROLL_TRADING_DAYS_BEFORE_EXPIRY)
             candidates.append((roll_date, exp, y % 100, code))
 
     # Sort by roll_date ascending; pick first one whose roll_date is in the future

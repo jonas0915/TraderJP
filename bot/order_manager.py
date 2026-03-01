@@ -137,21 +137,51 @@ class OrderManager:
             )
             return self._err("Already in short position — send close_short before selling again.")
 
+        # 4b. Total exposure check — new order + existing position must not
+        # exceed max contracts.
+        size_ok, size_reason = self.risk_manager.check_position_size_ok(position_qty, qty)
+        if not size_ok:
+            logger.warning(f"Trade BLOCKED (position size): {size_reason}")
+            return self._err(f"Position size blocked: {size_reason}")
+
         # 5. Place entry order
         tradovate_action = "Buy" if action == "buy" else "Sell"
         comment = signal.comment or f"TraderJP-{action}"
 
         try:
-            if signal.order_type == "limit" and signal.price:
+            # Use atomic OSO bracket when both stop-loss and take-profit are
+            # provided.  This sends entry + OCO bracket as a single request so
+            # there is zero window where the position has no protective orders.
+            if signal.stop_loss and signal.take_profit and signal.order_type != "limit":
+                entry_result = await asyncio.to_thread(
+                    self.client.place_oso_order,
+                    tradovate_action, symbol, qty,
+                    signal.stop_loss, signal.take_profit, comment,
+                )
+            elif signal.order_type == "limit" and signal.price:
                 entry_result = await asyncio.to_thread(
                     self.client.place_limit_order,
                     tradovate_action, symbol, qty, signal.price, comment
                 )
+                # Brackets for limit entries must still be placed separately
+                # because OSO only supports market entry orders.
+                if signal.stop_loss or signal.take_profit:
+                    await self._place_brackets_separately(
+                        action, symbol, qty, signal.stop_loss,
+                        signal.take_profit, comment,
+                    )
             else:
                 entry_result = await asyncio.to_thread(
                     self.client.place_market_order,
                     tradovate_action, symbol, qty, comment
                 )
+                # If only one bracket side is provided, fall back to separate
+                # orders (OSO requires both stop and TP).
+                if signal.stop_loss or signal.take_profit:
+                    await self._place_brackets_separately(
+                        action, symbol, qty, signal.stop_loss,
+                        signal.take_profit, comment,
+                    )
         except TradovateError as e:
             logger.error(f"Entry order failed: {e}")
             return self._err(f"Order rejected by Tradovate: {e}")
@@ -159,31 +189,6 @@ class OrderManager:
         logger.success(
             f"Entry order placed: {tradovate_action} {qty} {symbol} → {entry_result}"
         )
-
-        # 6. Place bracket orders (stop-loss / take-profit)
-        brackets = []
-        if signal.stop_loss:
-            brackets.append(
-                asyncio.create_task(
-                    self._place_bracket(
-                        "Sell" if action == "buy" else "Buy",
-                        symbol, qty, "stop", signal.stop_loss,
-                        f"{comment}-SL"
-                    )
-                )
-            )
-        if signal.take_profit:
-            brackets.append(
-                asyncio.create_task(
-                    self._place_bracket(
-                        "Sell" if action == "buy" else "Buy",
-                        symbol, qty, "limit", signal.take_profit,
-                        f"{comment}-TP"
-                    )
-                )
-            )
-        if brackets:
-            await asyncio.gather(*brackets, return_exceptions=True)
 
         return {
             "success": True,
@@ -244,7 +249,39 @@ class OrderManager:
                 return pos.get("netPos", 0)
         return 0
 
-    async def _place_bracket(
+    async def _place_brackets_separately(
+        self,
+        action: str,
+        symbol: str,
+        qty: int,
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+        comment: str,
+    ):
+        """Place stop-loss and/or take-profit as individual orders (fallback)."""
+        bracket_action = "Sell" if action == "buy" else "Buy"
+        tasks = []
+        if stop_loss:
+            tasks.append(
+                self._place_single_bracket(
+                    bracket_action, symbol, qty, "stop", stop_loss,
+                    f"{comment}-SL",
+                )
+            )
+        if take_profit:
+            tasks.append(
+                self._place_single_bracket(
+                    bracket_action, symbol, qty, "limit", take_profit,
+                    f"{comment}-TP",
+                )
+            )
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.error(f"Bracket order failed: {r}")
+
+    async def _place_single_bracket(
         self,
         action: str,
         symbol: str,

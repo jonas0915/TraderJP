@@ -50,8 +50,9 @@ class NewsFilter:
         self.countries           = [c.strip().upper() for c in countries]
         self.refresh_interval    = refresh_interval_sec
 
-        self._events:       list[NewsEvent] = []
-        self._last_refresh: Optional[datetime] = None
+        self._events:           list[NewsEvent] = []
+        self._last_refresh:     Optional[datetime] = None
+        self._refresh_failures: int = 0
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -68,6 +69,18 @@ class NewsFilter:
 
         self._maybe_refresh()
         now = now or datetime.now(self.UTC)
+
+        # If the calendar hasn't been fetched at all, or is stale for >6 h,
+        # block trading as a safety measure — we cannot know whether a
+        # high-impact event is imminent.
+        if self._last_refresh is not None:
+            age_hours = (now - self._last_refresh).total_seconds() / 3600
+            if self._refresh_failures >= 3 and age_hours > 6:
+                return True, (
+                    f"News calendar stale ({age_hours:.1f}h old, "
+                    f"{self._refresh_failures} consecutive refresh failures). "
+                    f"Blocking trades until calendar is updated."
+                )
 
         for event in self._events:
             before = event.dt_utc - timedelta(minutes=self.blackout_before_min)
@@ -136,7 +149,11 @@ class NewsFilter:
             resp.raise_for_status()
             raw = resp.json()
         except Exception as e:
-            logger.warning(f"NewsFilter: could not fetch calendar: {e}")
+            self._refresh_failures += 1
+            logger.warning(
+                f"NewsFilter: could not fetch calendar "
+                f"(failure #{self._refresh_failures}): {e}"
+            )
             return
 
         events = []
@@ -161,6 +178,7 @@ class NewsFilter:
             events.append(NewsEvent(title=title, country=country, dt_utc=dt_utc, impact=impact))
 
         self._events = events
+        self._refresh_failures = 0
         logger.info(
             f"NewsFilter: loaded {len(events)} {self.impact_levels} "
             f"{self.countries} events for the week."

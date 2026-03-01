@@ -99,11 +99,10 @@ class RiskManager:
         # All-time peak equity (for trailing drawdown).
         # Loaded from disk so a mid-session restart cannot reset the high-water
         # mark and allow a drawdown violation to go undetected.
-        self._peak_equity: float = self._load_peak_equity()
-        self._initialized: bool  = False
-
-        # Cumulative net profit across days (for consistency rule)
+        self._peak_equity: float = 0.0
         self._cumulative_net_profit: float = 0.0
+        self._load_persisted_state()
+        self._initialized: bool  = False
 
     # ------------------------------------------------------------------
     # Public helpers (called by order manager before placing orders)
@@ -139,6 +138,44 @@ class RiskManager:
                 f"${self.config.max_trailing_dd:.2f}."
             )
 
+        # Consistency rule: no single day's profit can exceed N% of cumulative
+        if self.config.consistency_rule:
+            ok, reason = self._check_consistency_rule()
+            if not ok:
+                return False, reason
+
+        return True, "OK"
+
+    def _check_consistency_rule(self) -> tuple[bool, str]:
+        """Block new entries if today's profit already threatens consistency.
+
+        The Apex consistency rule says no single day can account for more
+        than ``max_day_profit_pct`` of your total cumulative profit.  We
+        block *new* entries (not flatten) so the trader can still close
+        positions but cannot chase more profit on a hot day.
+
+        The rule only applies when there is meaningful prior cumulative
+        profit (from previous days).  If the trader has no prior profit
+        history, the rule cannot be meaningfully applied.
+        """
+        day_profit = self._day.realized_pnl + self._day.unrealized_pnl
+        if day_profit <= 0:
+            return True, "OK"  # only relevant when day is profitable
+
+        # Need meaningful prior cumulative profit for the ratio to matter.
+        # Without prior profit the rule is undefined (you'd be at 100% on
+        # your very first profitable day, which is obviously fine).
+        if self._cumulative_net_profit <= 0:
+            return True, "OK"
+
+        total = self._cumulative_net_profit + day_profit
+        day_pct = day_profit / total
+        if day_pct >= self.config.max_day_profit_pct:
+            return False, (
+                f"Consistency rule: today's profit ${day_profit:,.2f} is "
+                f"{day_pct * 100:.0f}% of cumulative ${total:,.2f} "
+                f"(limit: {self.config.max_day_profit_pct * 100:.0f}%)."
+            )
         return True, "OK"
 
     def check_position_size_ok(self, current_qty: int, new_qty: int) -> tuple[bool, str]:
@@ -224,7 +261,7 @@ class RiskManager:
             # the previous high-water mark, not reset it.
             if self._peak_equity == 0.0:
                 self._peak_equity = current_equity
-                self._save_peak_equity()
+                self._save_state()
             self._initialized = True
             logger.info(
                 f"Risk manager initialised. Starting balance: "
@@ -235,7 +272,7 @@ class RiskManager:
         # Update trailing peak and persist whenever it moves higher
         if current_equity > self._peak_equity:
             self._peak_equity = current_equity
-            self._save_peak_equity()
+            self._save_state()
 
         daily_loss  = self._current_daily_loss()
         trailing_dd = self._current_trailing_dd()
@@ -270,35 +307,38 @@ class RiskManager:
 
         # EOD flatten
         if self.config.eod_flatten_minutes > 0 and not self._day.flattened_today:
-            self._check_eod_flatten()
+            await self._check_eod_flatten()
 
     # ------------------------------------------------------------------
     # Peak equity persistence
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _load_peak_equity() -> float:
-        """Return persisted peak equity, or 0.0 if no state file exists."""
+    def _load_persisted_state(self):
+        """Load peak equity and cumulative profit from disk."""
         try:
             if _PEAK_STATE_FILE.exists():
                 data = json.loads(_PEAK_STATE_FILE.read_text())
-                val = float(data.get("peak_equity", 0.0))
-                if val > 0:
-                    logger.info(f"Loaded persisted peak equity: ${val:,.2f}")
-                return val
+                peak = float(data.get("peak_equity", 0.0))
+                cum = float(data.get("cumulative_net_profit", 0.0))
+                if peak > 0:
+                    self._peak_equity = peak
+                    logger.info(f"Loaded persisted peak equity: ${peak:,.2f}")
+                if cum != 0:
+                    self._cumulative_net_profit = cum
+                    logger.info(f"Loaded persisted cumulative profit: ${cum:,.2f}")
         except Exception as e:
-            logger.warning(f"Could not load peak equity state: {e}")
-        return 0.0
+            logger.warning(f"Could not load persisted risk state: {e}")
 
-    def _save_peak_equity(self):
-        """Persist current peak equity to survive restarts."""
+    def _save_state(self):
+        """Persist peak equity and cumulative profit to survive restarts."""
         try:
             _PEAK_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            _PEAK_STATE_FILE.write_text(
-                json.dumps({"peak_equity": round(self._peak_equity, 2)})
-            )
+            _PEAK_STATE_FILE.write_text(json.dumps({
+                "peak_equity": round(self._peak_equity, 2),
+                "cumulative_net_profit": round(self._cumulative_net_profit, 2),
+            }))
         except Exception as e:
-            logger.error(f"Could not persist peak equity: {e}")
+            logger.error(f"Could not persist risk state: {e}")
 
     def _current_daily_loss(self) -> float:
         """Positive value = how much we've lost today (including open P&L)."""
@@ -322,10 +362,11 @@ class RiskManager:
         if today != self._day.date:
             logger.info(f"New trading day: {today}. Resetting daily stats.")
             self._cumulative_net_profit += self._day.realized_pnl
+            self._save_state()   # persist cumulative profit across day boundary
             self._day = DayStats(date=today)
             self._initialized = False
 
-    def _check_eod_flatten(self):
+    async def _check_eod_flatten(self):
         """Flatten N minutes before RTH close (15:15 CT for ES)."""
         now_ct = datetime.now(self.CT)
         # ES RTH close: 15:15 CT
@@ -338,7 +379,7 @@ class RiskManager:
             logger.warning(
                 f"EOD flatten: {minutes_to_close} min before RTH close."
             )
-            asyncio.create_task(self._emergency_flatten("eod_flatten"))
+            await self._emergency_flatten("eod_flatten")
 
     async def _emergency_flatten(self, reason: str):
         self._day.flattened_today = True

@@ -35,6 +35,7 @@ Simpler version (hard-coded):
 """
 
 import os
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -45,7 +46,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from loguru import logger
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 from bot.order_manager import OrderManager, TradeSignal
 from bot.risk_manager import RiskManager
@@ -53,21 +54,38 @@ from bot.news_filter import NewsFilter
 from bot.session_filter import SessionFilter
 
 # ---------------------------------------------------------------------------
-# Simple in-memory rate limiter (per source IP, for the /webhook endpoint)
+# In-memory rate limiter with automatic stale-IP cleanup
 # ---------------------------------------------------------------------------
 _RATE_LIMIT_MAX    = 10    # max requests per window
 _RATE_LIMIT_WINDOW = 60   # seconds
-_rate_store: dict = defaultdict(list)
+_CLEANUP_INTERVAL  = 300  # purge stale IPs every 5 minutes
+_rate_store: dict[str, list[float]] = {}
+_rate_lock = threading.Lock()
+_last_cleanup: float = 0.0
+
 
 def _check_rate_limit(ip: str) -> bool:
     """Return True if the request is within the allowed rate, False otherwise."""
     now = time.monotonic()
-    timestamps = _rate_store[ip]
-    timestamps[:] = [t for t in timestamps if now - t < _RATE_LIMIT_WINDOW]
-    if len(timestamps) >= _RATE_LIMIT_MAX:
-        return False
-    timestamps.append(now)
-    return True
+
+    with _rate_lock:
+        # Periodic cleanup of stale IPs to prevent unbounded memory growth
+        global _last_cleanup
+        if now - _last_cleanup > _CLEANUP_INTERVAL:
+            stale = [
+                k for k, v in _rate_store.items()
+                if not v or (now - v[-1]) > _RATE_LIMIT_WINDOW
+            ]
+            for k in stale:
+                del _rate_store[k]
+            _last_cleanup = now
+
+        timestamps = _rate_store.setdefault(ip, [])
+        timestamps[:] = [t for t in timestamps if now - t < _RATE_LIMIT_WINDOW]
+        if len(timestamps) >= _RATE_LIMIT_MAX:
+            return False
+        timestamps.append(now)
+        return True
 
 
 # ------------------------------------------------------------------
@@ -85,12 +103,14 @@ class WebhookPayload(BaseModel):
     comment:     str         = ""
     symbol:      str         = ""            # optional symbol override
 
-    @validator("action")
-    def action_lowercase(cls, v):
+    @field_validator("action")
+    @classmethod
+    def action_lowercase(cls, v: str) -> str:
         return v.lower().strip()
 
-    @validator("order_type")
-    def order_type_lowercase(cls, v):
+    @field_validator("order_type")
+    @classmethod
+    def order_type_lowercase(cls, v: str) -> str:
         return v.lower().strip()
 
 
